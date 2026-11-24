@@ -62,7 +62,9 @@ def fetch_star(slug: str) -> dict:
         "birthday": birthday.group(1) if birthday else None,
         "image_url": image.group(0) if image else None,
         "company": (
-            {"name": company.group(3), "slug": company.group(2)} if company else None
+            {"name": company.group(3).strip(), "slug": company.group(2)}
+            if company
+            else None
         ),
         "ships": ships,
         "socials": socials,
@@ -146,16 +148,26 @@ def _social_kind(url: str) -> str:
     return host
 
 
+_BIO_HEADS = (
+    "Biography \\u0026 Education",
+    "Biography & Education",
+    "Biography \\u0026 Career Path",
+    "Biography & Career Path",
+)
+
+
 def _biography(html: str) -> str | None:
-    start = html.find("Biography \\u0026 Career Path")
-    if start < 0:
-        start = html.find("Biography & Career Path")
+    start = -1
+    for head in _BIO_HEADS:
+        start = html.find(head)
+        if start >= 0:
+            break
     if start < 0:
         return None
-    end = re.search(r"\.\d+:\[", html[start:])
+    end = re.search(r"\d+:\[", html[start:])
     if end is None:
         return None
-    text = html[start : start + end.start() + 1]
+    text = html[start : start + end.start()]
     text = (
         text.replace("\\r\\n", "\n")
         .replace("\\n", "\n")

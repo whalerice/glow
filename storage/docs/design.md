@@ -12,9 +12,9 @@
 - `work` upsert
 - `person_work` 연결
 
-1차에 행을 만들지 않는 것:
+1차 인물 응답만으로 만들지 않는 것:
 
-- `company`, `person_company`. 테이블만 만든다. 소속사 행은 비운다.
+- 소속사 `person_company`는 kuryana 인물 응답에 없다. Sapphic Effect에서 고른 소속사만 넣는다. 방송사 `company`, `company_type`, `work_company`는 드라마 상세 `original_network`로 만든다.
 
 이유: 2026-11-23에 `GET /v2/people/70935`와 `GET /v2/people/4444`를 호출했다. `data`에 소속사 필드가 없다. Freen 샘플의 `about` 문장에만 "Solenn Entertainment", "IdolFactory"가 있다. `about` 문장을 파싱해 회사를 만들지 않는다.
 
@@ -39,7 +39,7 @@ MDL 인물 주소는 `https://mydramalist.com/people/70935-freen-sarocha-chankim
 
 PostgreSQL. 언어는 Python. 이 수집기는 HTTP JSON을 받아 PostgreSQL에 넣는 작업이라 Python이 맞다.
 
-1차 실행 형태는 웹 서버가 아니라 CLI다. Docker Compose로 `postgres`와 수집 앱을 올린다.
+실행은 웹과 CLI다. Docker Compose로 `postgres`, 웹, 수집 CLI를 올린다.
 
 MDL 소스는 kuryana (`tbdsux/kuryana`)의 공개 호스트다. `B1PL0/MyDramaList-Unofficial-API`는 쓰지 않는다. 앱은 kuryana를 HTTP로만 호출한다. kuryana 자체 호스팅은 1차 범위 밖이다.
 
@@ -66,8 +66,10 @@ docker compose run --rm app register 70935
 2. `person`을 `mdl_id = 숫자 id`로 만든다. 이미 있으면 그 행을 재사용한다. 재실행은 새 행이 아니라 재수집이다.
 3. 수집을 시작하기 전에 `collect_status = registered`, `collect_error = null`로 둔다.
 4. `GET {KURYANA_BASE_URL}/v2/people/{id}`를 호출한다. `{id}`는 숫자만이다.
-5. 성공하면 프로필을 갱신하고, 출연작을 upsert하고, 그 배우의 `person_work`를 이번 응답 기준으로 바꾼 뒤 `collected`로 둔다.
+5. 성공하면 프로필을 갱신하고, 출연작을 upsert하고, 그 배우의 `person_work`를 이번 응답 기준으로 바꾼 뒤 `collected`로 둔다. 이 경로는 `person_role`에 `a`를 넣는다. kuryana가 Drama 표를 하나만 남기면 인물 페이지의 Drama·Movie 표를 합친다. TV Show는 넣지 않는다. 커밋 뒤 `tmdb_id`가 비어 있는 작품만 TMDB를 찾는다. 상세 `homepage`는 `work.homepage`에 둔다. 그 작품 상세의 네트워크·제작사 이름이 기존 `company.name`과 같으면 빈 `logo_url`, `homepage`만 채우고 타입을 추가한다. 시청처 이름은 회사로 넣거나 재사용하고 `배급사`를 추가한다. `logo_path`는 빈 `logo_url`만 전체 주소로 채운다.
 6. 실패하면 행을 지우지 않는다. `failed`와 사유만 남긴다. 이전에 `collected`였던 프로필과 출연작은 그대로 둔다.
+
+배우 목록의 작품 가져오기는 역할 `a`만 다시 수집한다. 진행은 끝낸 수, 전체 수, 지금 이름이다. 2초마다 그 칸과 표의 출연·상태·시각만 바꾼다. 목록 전체를 다시 그리지 않는다.
 
 ## 테이블
 
@@ -82,26 +84,61 @@ docker compose run --rm app register 70935
 - `name`, `native_name`, `first_name`, `family_name` text. 응답으로만 채운다
 - `also_known_as` text[]
 - `nationality`, `gender` text
-- `born_text` text. 응답 `born`은 `"September 24, 1979"` 같은 문장이다. 1차는 파싱하지 않는다
-- `age` int
-- `image_url`, `about` text
+- `stage_name` text. `name`에서 `first_name` 앞을 뗀 활동명
+- `born_text` text. `November 25, 1999`처럼 `Month D, YYYY`이고 그 날이 맞으면 `1999-11-25`. 이미 `YYYY-MM-DD`면 그대로. 월이 없거나 날이 없으면 원문. 예: `September 22, ????`
+- `image_url` text
+- `about` text. 배우 등록 수집은 비운다. 작가·감독 가져오기는 `data.about`을 넣는다. `Add Biography`는 넣지 않는다
+- `socials` jsonb NOT NULL default `[]`. 항목은 `{kind, url}`. 작가·감독 가져오기 때만 MDL Details의 SNS 줄을 넣는다. 빈 배열이면 기존 값을 덮지 않는다
 - `mdl_url` text. 응답 바깥 `link`. 여기에는 영문 이름이 포함된 주소가 들어온다
 - `collect_status` text NOT NULL. `registered` | `collected` | `failed`
 - `collect_error` text
 - `collected_at` timestamptz
 - `created_at` timestamptz NOT NULL default `now()`
 
+### role
+
+- `code` text PRIMARY KEY. `a` 배우, `d` 감독, `w` 작가
+- `name` text NOT NULL
+
+### person_role
+
+- `person_id` → `person.id`
+- `role_code` → `role.code`
+- PRIMARY KEY `(person_id, role_code)`
+
+배우 등록은 `a`를 넣는다. 작가·감독 가져오기는 `Director` → `d`, `Screenwriter` → `w`, `Screenwriter & Director` → `d`와 `w`. 이미 `a`인 사람의 프로필은 이 경로가 덮지 않는다. 역할 행은 추가한다. 배우 목록과 작품 가져오기는 `a`만 본다.
+
 ### work
 
 - `id`
 - `mdl_id` text UNIQUE NULL. 작품 slug의 앞 숫자. 예: slug `40509-persona-2` → `40509`
 - `title` text NOT NULL
-- `kind` text NOT NULL. `drama` | `movie` | `tv_show`
+- `kind` text NOT NULL. 수집은 `drama` | `movie`. `tv_show`는 체크에만 있고 TV Show 표는 넣지 않는다
 - `year` int
 - `episodes` int
 - `rating` numeric
 - `mdl_url` text. 응답 `link`. 영문 제목이 붙은 주소
+- `aired` text. `Oct 19, 2024 - Jan 4, 2025` → `2024-10-19 ~ 2025-01-04`
+- `aired_on` text. 드라마 상세 `aired_on`
+- `content_rating` text. `13+ - Teens 13 or older` → `13+`. `18+ Restricted (violence & profanity)` → `18+`. `G - All Ages` → `전체관람가`
+- `tmdb_id` bigint NULL. TMDB `movie` 또는 `tv` id. 배우 수집 때 비어 있으면 검색으로 채운다. 사람이 고친 값은 다음 수집에서 유지한다
+- `tmdb_kind` text NULL. `movie` | `tv`
+- `homepage` text NULL. `GET /3/{movie|tv}/{id}`의 `homepage`. `http://` 또는 `https://`만. 없으면 비운다. 다시 가져오면 그 값으로 바꾼다
+- `image_url`, `synopsis`, `native_title` text. `tags` text[]
+- `detail_at`, `networks_at`, `air_at` timestamptz. 드라마 상세를 받은 시각. 비어 있으면 작품 화면에서 다시 읽는다
+- `deleted` smallint NOT NULL default `0`. 작품 목록과 작품 상세의 예외는 `1`로 둔다. 상세에서 누르면 작품 목록 Show로 돌아간다. 행은 지우지 않는다. 목록 기본은 `0`. `1`만 보거나 전체를 고를 수 있다. `1`은 작품 상세를 열지 않고, 그 목록 제목은 링크가 아니다. 배우 상세·회사·작가 목록의 작품 목록에서는 `1`을 뺀다. 배우 목록의 출연 칸은 보이는 수와 숨긴 수를 `40(7)`로 보여 준다. 그 수는 작가·감독 역할의 `person_work`를 뺀다. 다시 수집해도 `deleted`는 유지한다
 - `created_at` timestamptz NOT NULL default `now()`
+
+### work_provider
+
+TMDB watch providers. 한국 `KR`, 태국 `TH`만. MDL Where to Watch는 저장하지 않는다.
+
+- `work_id` → `work.id`
+- `country` text. `KR` | `TH`
+- `name` text. 제공처 이름
+- `offer` text. `유료 구독` | `Free` | `광고` | `대여` | `구매`
+- `url` text NULL. 그 나라 응답의 `link`. 같은 나라 제공처는 같은 주소다
+- PRIMARY KEY `(work_id, country, name, offer)`
 
 slug 앞에 숫자가 없는 항목만 `title + year + kind`로 찾는다. 2026-11-23 샘플의 출연작은 전부 `slug`가 있었고, 앞부분은 숫자였다.
 
@@ -118,26 +155,48 @@ slug 앞에 숫자가 없는 항목만 `title + year + kind`로 찾는다. 2026-
 
 ### company
 
-스키마만 둔다. 1차 수집은 INSERT하지 않는다.
+MDL `original_network`는 이름만 넣는다. 같은 `name_key`면 기존 행을 재사용한다.
 
 - `id`
-- `mdl_id` text UNIQUE NULL. 값이 생기면 숫자만
 - `name` text NOT NULL
-- `name_key` text NOT NULL. 정규화한 이름. `mdl_id`가 없을 때의 매칭키
-- `match_status` text NOT NULL default `name_only`
+- `name_key` text NOT NULL. 정규화한 이름. 공백은 `_`. `Idol Factory` → `idol_factory`. 회사 매칭키
+- `sapphic_slug` text NULL. Sapphic Effect 회사 slug
+- `logo_url` text. 전체 주소. 작품 TMDB에서 이름이 같을 때, 또는 시청처 `logo_path`로 빈 값만
+- `homepage` text. 작품 TMDB에서 이름이 같을 때 빈 값만
 - `created_at` timestamptz NOT NULL default `now()`
 
 ### person_company
 
-스키마만 둔다. 1차 수집은 INSERT하지 않는다.
+kuryana 인물 응답은 넣지 않는다. Sapphic Effect에서 고른 소속사는 `relation = agency`로 넣는다.
 
 - `id`
 - `person_id` → `person.id`
 - `company_id` → `company.id`
 - `relation` text NOT NULL default `agency`
-- UNIQUE `(person_id, company_id, relation)`
+- `start_year`, `end_year` integer. `period_text` text. `is_current` boolean NOT NULL default false
 
-제작사 연결 `work_company`는 1차에 만들지 않는다.
+### org_type
+
+- `id`
+- `name` text NOT NULL UNIQUE. `제작사`, `배급사`, `방송사`, `엔터테이먼트`
+
+### company_type
+
+회사 하나에 타입이 여러 개다.
+
+- `company_id` → `company.id`
+- `org_type_id` → `org_type.id`
+- PRIMARY KEY `(company_id, org_type_id)`
+
+MDL 방송사 수집은 `방송사`만 붙인다. 작품 TMDB에서 이름이 같은 회사가 `production_companies`에 있으면 `제작사`와 `배급사`를 추가하고, `networks`에 있으면 `방송사`를 추가한다. 그 두 경로는 없는 회사를 만들지 않는다. 시청처 `provider_name`은 `name_key`로 회사를 만들거나 재사용하고 `배급사`를 추가한다. `logo_path`는 전체 이미지 주소로 빈 `logo_url`만 채운다. Sapphic Effect에서 고른 소속사는 `엔터테이먼트`를 추가한다. 이미 있는 타입은 지우지 않는다.
+
+### work_company
+
+- `work_id` → `work.id`
+- `company_id` → `company.id`
+- PRIMARY KEY `(work_id, company_id)`
+
+MDL `original_network`가 이 연결이다. 그 작품의 연결은 응답으로 교체한다.
 
 ## 필드 매핑
 
@@ -147,7 +206,7 @@ slug 앞에 숫자가 없는 항목만 `title + year + kind`로 찾는다. 2026-
 
 - 바깥: `success`, `data`, `link`, `scraped_at`
 - `data`: `name`, `native_name`, `also_known_as`, `nationality`, `gender`, `born`, `age`, `first_name`, `family_name`, `image`, `about`, `works`
-- `works`는 종류별 배열. 확인된 키: `Drama`, `Movie`, `TV Show`
+- `works`는 종류별 배열. 확인된 키: `Drama`, `Movie`, `TV Show`. 저장은 `Drama`, `Movie`만
 - 배열 항목: `title`, `slug`, `link`, `year`, `episodes`, `rating`, `character`, `role`
 
 `also_known_as`는 없을 수 있다. Kim Jong Min 샘플에는 있었고 Freen 샘플에는 없었다. 없으면 빈 배열.
@@ -160,16 +219,13 @@ slug 앞에 숫자가 없는 항목만 `title + year + kind`로 찾는다. 2026-
 | `data.also_known_as` | `person.also_known_as` |
 | `data.nationality` | `person.nationality` |
 | `data.gender` | `person.gender` |
-| `data.born` | `person.born_text` |
-| `data.age` | `person.age` |
-| `data.first_name` | `person.first_name` |
+| `data.born` | `person.born_text`. `Month D, YYYY`가 맞는 날이면 `YYYY-MM-DD`. 아니면 원문 |
+| `data.first_name` | `person.first_name`, `person.stage_name` |
 | `data.family_name` | `person.family_name` |
 | `data.image` | `person.image_url` |
-| `data.about` | `person.about` |
 | `link` | `person.mdl_url` |
 | `works.Drama[]` | `work.kind = drama` |
 | `works.Movie[]` | `work.kind = movie` |
-| `works.TV Show[]` | `work.kind = tv_show` |
 | 항목 `slug`의 앞 숫자 | `work.mdl_id` |
 | 항목 `title` | `work.title` |
 | 항목 `year` | `work.year` |
@@ -179,7 +235,7 @@ slug 앞에 숫자가 없는 항목만 `title + year + kind`로 찾는다. 2026-
 | 항목 `role` | `person_work.role` |
 | 항목 `character` | `person_work.character_name` |
 
-`success != true` 이거나 HTTP가 200이 아니면 프로필과 출연작을 쓰지 않고 `failed`로 둔다. `about`은 프로필 본문으로만 저장한다. 회사 추출에 쓰지 않는다.
+`success != true` 이거나 HTTP가 200이 아니면 프로필과 출연작을 쓰지 않고 `failed`로 둔다. 배우 등록의 `about`은 저장하지 않는다. 작가·감독 가져오기의 `about`은 `person.about`에 둔다. `Add Biography`는 버린다. 회사 추출에 쓰지 않는다. `TV Show`는 읽지 않는다.
 
 ## upsert 규칙
 
@@ -188,7 +244,7 @@ slug 앞에 숫자가 없는 항목만 `title + year + kind`로 찾는다. 2026-
 1. `work`는 숫자 `mdl_id`가 있으면 그 값으로 upsert한다. 같은 번호면 `title`, `kind`, `year`, `episodes`, `rating`, `mdl_url`만 갱신하고 `work.id`는 유지한다. 다른 배우가 이미 연결한 작품 행을 복제하지 않는다.
 2. 숫자 `mdl_id`가 없을 때만 `title + year + kind`로 기존 행을 찾고, 없으면 INSERT한다.
 3. 그 배우의 `person_work`는 DELETE 후 이번 `works`로 다시 INSERT한다. 응답에서 빠진 출연은 연결이 사라진다. `work` 행은 지우지 않는다. 다른 배우가 쓸 수 있다.
-4. `company`, `person_company`는 이 트랜잭션에서 건드리지 않는다.
+4. 드라마 상세를 받은 작품은 `original_network`로 `company`, `company_type`(`방송사`), `work_company`를 갱신한다. `person_company`는 건드리지 않는다.
 
 ## 상태
 
@@ -198,14 +254,21 @@ slug 앞에 숫자가 없는 항목만 `title + year + kind`로 찾는다. 2026-
 | `collected` | 프로필과 출연작 반영이 끝났다 |
 | `failed` | 이번 호출이 실패했다. 행은 유지한다 |
 
-실패 사유는 `collect_error`에 HTTP 상태와 응답 `message`만 남긴다. 재시도는 같은 CLI를 다시 실행한다. 자동 재시도 루프는 두지 않는다. 요청은 등록 1회당 인물 조회 1회다.
+실패 사유는 `collect_error`에 HTTP 상태와 응답 `message`만 남긴다. 재시도는 같은 CLI를 다시 실행한다. 자동 재시도 루프는 두지 않는다. 인물 조회 1회 뒤에 필모그래피 표를 합치려고 인물 페이지를 한 번 더 읽는다. 그 페이지를 못 읽으면 kuryana 목록만 쓴다.
+
+## 배우 삭제
+
+배우 상세의 삭제. `person_role`에 `a`가 있을 때만. 없으면 404.
+
+지우는 행: 그 사람의 `person_work`, `person_source`, `person_company`, `person_ship`, 그 사람만 남아 있던 `ship`, `person_role`, `person`. `work`와 `company`는 남긴다. `a`이면서 `d` 또는 `w`여도 `person` 행을 지우므로 그 역할 연결도 끊긴다.
 
 ## Docker Compose
 
-서비스는 둘이다.
+서비스는 셋이다.
 
-- `postgres`: 공식 PostgreSQL 이미지. 데이터는 named volume. 앱이 붙기 전에 healthy여야 한다.
-- `app`: 수집 CLI 이미지. 상시 서버가 아니다. `storage`에서 `docker compose run --rm app register 70935`로 한 번 실행하고 끝난다. `postgres` healthy 이후에 시작한다.
+- `postgres`: 공식 PostgreSQL 이미지. 데이터는 named volume. 앱이 붙기 전에 healthy여야 한다. 호스트 포트는 `5433`.
+- `web`: 상시 서버. 호스트 포트는 `8000`. 기동 때 스키마를 맞춘다.
+- `app`: 수집 CLI. 상시 서버가 아니다. `storage`에서 `docker compose run --rm app register 70935`로 한 번 실행하고 끝난다. `postgres` healthy 이후에 시작한다.
 
 `register` 뒤의 값은 배우 이름이 아니다. MDL 숫자 id다.
 
@@ -218,12 +281,13 @@ slug 앞에 숫자가 없는 항목만 `title + year + kind`로 찾는다. 2026-
 - `DATABASE_URL`: 앱이 쓰는 PostgreSQL URL. Compose가 `postgres` 서비스 기준으로 넣는다.
 - `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`: `postgres` 서비스 초기화용.
 - `KURYANA_BASE_URL`: 기본값 `https://kuryana.tbdh.app`. 끝 슬래시 없이 쓴다. 인물 조회는 `{KURYANA_BASE_URL}/v2/people/{id}`다.
+- `tmdb_access_token_auth`: TMDB API 읽기 토큰. `storage/.env`. 웹과 CLI 컨테이너에 넣는다.
+- `HTTP_USER_AGENT`: 위키와 GMMTV 위키, Sapphic Effect 요청 이름. 없으면 `glow-collect/0.1`.
 
 ## 범위 밖
 
-- kuryana 자체 호스팅, MDL HTML 직접 수집
+- kuryana 자체 호스팅
 - 명령 인자로 배우 이름을 받아 검색
-- `about`에서 소속사 추출, `company` / `person_company` INSERT
-- 에피소드, 방영 캘린더, 콘서트, 뉴스, TMDB, 위키, 티켓
-- 웹 화면, 수집 스케줄러, 자동 재시도
-- `work_company`
+- `about`에서 소속사 추출
+- MDL Where to Watch, TV Show 표
+- 방영 캘린더, 콘서트, 뉴스, 티켓, 수집 스케줄러

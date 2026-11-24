@@ -4,16 +4,34 @@ import re
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import date
 from pathlib import Path
 from typing import NamedTuple
 
-import psycopg
+from bs4 import BeautifulSoup
+from curl_cffi import requests as cffi_requests
 
+import psycopg
+from psycopg.types.json import Json
+
+from app.agency import name_key
 from app.ids import person_mdl_id, work_mdl_id
+from app.tmdb import fill_person
 
 SCHEMA_PATH = Path(__file__).resolve().parent.parent / "sql" / "schema.sql"
 KINDS = {"Drama": "drama", "Movie": "movie"}
 CREDIT_ROLES = ("Screenwriter & Director", "Director", "Screenwriter")
+_CREDIT_ROLE_CODES = {
+    "Director": ("d",),
+    "Screenwriter": ("w",),
+    "Screenwriter & Director": ("d", "w"),
+}
+_BORN_MONTHS = {
+    "january": 1, "february": 2, "march": 3, "april": 4,
+    "may": 5, "june": 6, "july": 7, "august": 8,
+    "september": 9, "october": 10, "november": 11, "december": 12,
+}
+NETWORK_TYPE = "방송사"
 
 
 class DramaDetail(NamedTuple):
@@ -21,6 +39,10 @@ class DramaDetail(NamedTuple):
     synopsis: str | None
     native_title: str | None
     tags: list[str]
+    networks: list[str]
+    aired: str | None
+    aired_on: str | None
+    content_rating: str | None
 
 
 class CollectResult(NamedTuple):
@@ -41,6 +63,8 @@ def register(raw_id: str) -> CollectResult:
         conn.commit()
 
     body, error = fetch_person(mdl_id)
+    if body is not None and error is None:
+        fill_filmography(body)
     posters = poster_map(body) if body is not None and error is None else {}
     with connect() as conn:
         if error is not None or body is None:
@@ -55,6 +79,10 @@ def register(raw_id: str) -> CollectResult:
             conn.commit()
             return CollectResult(mdl_id, "failed", person_id)
         conn.commit()
+    try:
+        fill_person(person_id)
+    except Exception:
+        pass
     return CollectResult(mdl_id, "collected", person_id, link_count)
 
 
@@ -66,11 +94,146 @@ def connect() -> psycopg.Connection:
 
 
 def apply_schema(conn: psycopg.Connection) -> None:
+    kept = _drop_keyed_company_type(conn)
+    _rename_type_tables(conn)
     script = SCHEMA_PATH.read_text()
     for statement in script.split(";"):
         sql = statement.strip()
         if sql:
             conn.execute(sql)
+    if kept is not None:
+        for company_id, name in kept:
+            conn.execute(
+                """
+                INSERT INTO company_type (company_id, org_type_id)
+                SELECT %s, id FROM org_type WHERE name = %s
+                ON CONFLICT DO NOTHING
+                """,
+                (company_id, name),
+            )
+    _rewrite_aired(conn)
+    _rewrite_ratings(conn)
+    _rewrite_company_keys(conn)
+    _fill_person_roles(conn)
+    _normalize_born_texts(conn)
+
+
+def _drop_keyed_company_type(conn: psycopg.Connection) -> list[tuple] | None:
+    old = conn.execute(
+        """
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'company_type' AND column_name = 'key'
+        """
+    ).fetchone()
+    if old is None:
+        return None
+    kept = conn.execute(
+        """
+        SELECT l.company_id, t.key
+        FROM company_type_link l
+        JOIN company_type t ON t.key = l.type_key
+        """
+    ).fetchall()
+    conn.execute("DROP TABLE company_type_link")
+    conn.execute("DROP TABLE company_type")
+    return [(int(company_id), name) for company_id, name in kept]
+
+
+def _rename_type_tables(conn: psycopg.Connection) -> None:
+    old = conn.execute(
+        """
+        SELECT 1 FROM information_schema.tables
+        WHERE table_schema = 'public' AND table_name = 'company_type_link'
+        """
+    ).fetchone()
+    if old is None:
+        return
+    conn.execute("ALTER TABLE company_type RENAME TO org_type")
+    conn.execute("ALTER TABLE company_type_link RENAME TO company_type")
+    conn.execute("ALTER TABLE company_type RENAME COLUMN company_type_id TO org_type_id")
+
+
+def grant_person_roles(conn: psycopg.Connection, person_id: int, codes: tuple[str, ...]) -> None:
+    for code in codes:
+        conn.execute(
+            """
+            INSERT INTO person_role (person_id, role_code)
+            VALUES (%s, %s)
+            ON CONFLICT DO NOTHING
+            """,
+            (person_id, code),
+        )
+
+
+def credit_role_codes(role: str) -> tuple[str, ...]:
+    return _CREDIT_ROLE_CODES.get(role, ())
+
+
+def normalize_born(value: object) -> str | None:
+    text = text_or_none(value)
+    if text is None:
+        return None
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        return text
+    match = re.fullmatch(r"([A-Za-z]+)\s+(\d{1,2}),\s*(\d{4})", re.sub(r"\s+", " ", text))
+    if match is None:
+        return text
+    month = _BORN_MONTHS.get(match.group(1).casefold())
+    if month is None:
+        return text
+    try:
+        return date(int(match.group(3)), month, int(match.group(2))).isoformat()
+    except ValueError:
+        return text
+
+
+def _fill_person_roles(conn: psycopg.Connection) -> None:
+    has_listed = conn.execute(
+        """
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'person' AND column_name = 'listed'
+        """
+    ).fetchone()
+    if has_listed:
+        conn.execute(
+            """
+            INSERT INTO person_role (person_id, role_code)
+            SELECT id, 'a' FROM person WHERE listed
+            ON CONFLICT DO NOTHING
+            """
+        )
+        conn.execute("ALTER TABLE person DROP COLUMN listed")
+    conn.execute(
+        """
+        INSERT INTO person_role (person_id, role_code)
+        SELECT DISTINCT person_id, 'd'
+        FROM person_work
+        WHERE role IN ('Director', 'Screenwriter & Director')
+        ON CONFLICT DO NOTHING
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO person_role (person_id, role_code)
+        SELECT DISTINCT person_id, 'w'
+        FROM person_work
+        WHERE role IN ('Screenwriter', 'Screenwriter & Director')
+        ON CONFLICT DO NOTHING
+        """
+    )
+
+
+def _normalize_born_texts(conn: psycopg.Connection) -> None:
+    rows = conn.execute(
+        "SELECT id, born_text FROM person WHERE born_text IS NOT NULL"
+    ).fetchall()
+    for person_id, raw in rows:
+        parsed = normalize_born(raw)
+        if parsed != raw:
+            conn.execute(
+                "UPDATE person SET born_text = %s WHERE id = %s",
+                (parsed, person_id),
+            )
 
 
 def mark_registered(conn: psycopg.Connection, mdl_id: str) -> int:
@@ -80,13 +243,14 @@ def mark_registered(conn: psycopg.Connection, mdl_id: str) -> int:
         VALUES (%s, 'registered')
         ON CONFLICT (mdl_id) DO UPDATE
         SET collect_status = 'registered',
-            collect_error = NULL,
-            listed = true
+            collect_error = NULL
         RETURNING id
         """,
         (mdl_id,),
     ).fetchone()
-    return int(row[0])
+    person_id = int(row[0])
+    grant_person_roles(conn, person_id, ("a",))
+    return person_id
 
 
 def mark_failed(conn: psycopg.Connection, person_id: int, error: str) -> None:
@@ -132,6 +296,173 @@ def fetch_person(mdl_id: str) -> tuple[dict | None, str | None]:
     return body, None
 
 
+_FILM_KINDS = ("Drama", "Movie")
+
+
+def fill_filmography(body: dict) -> None:
+    data = body.get("data")
+    if not isinstance(data, dict):
+        return
+    parsed = fetch_person_filmography(text_or_none(body.get("link")))
+    if not parsed:
+        return
+    current = data.get("works") if isinstance(data.get("works"), dict) else {}
+    known: dict[str, dict] = {}
+    for items in current.values():
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            slug = item.get("slug") if isinstance(item, dict) else None
+            if isinstance(slug, str):
+                known[slug] = item
+    works: dict[str, list] = {}
+    for kind in _FILM_KINDS:
+        merged = []
+        for item in parsed.get(kind, []):
+            old = known.get(item["slug"])
+            if old is not None:
+                if item.get("episodes") is None and isinstance(old.get("episodes"), int):
+                    item["episodes"] = old["episodes"]
+                if item.get("rating") is None and isinstance(old.get("rating"), (int, float)):
+                    item["rating"] = old["rating"]
+            merged.append(item)
+        works[kind] = merged
+    data["works"] = works
+
+
+_SOCIAL_LABELS = {
+    "instagram": "instagram",
+    "twitter": "x",
+    "x": "x",
+    "tiktok": "tiktok",
+    "facebook": "facebook",
+    "youtube": "youtube",
+    "weibo": "weibo",
+    "threads": "threads",
+}
+
+
+def fetch_person_socials(link: str | None) -> list[dict]:
+    if not link or "/people/" not in link:
+        return []
+    try:
+        response = cffi_requests.get(link, impersonate="chrome110", timeout=20)
+    except Exception:
+        return []
+    if response.status_code != 200:
+        return []
+    soup = BeautifulSoup(response.text, "html.parser")
+    found = []
+    seen: set[str] = set()
+    for header in soup.select("div.box-header"):
+        if header.get_text(strip=True) != "Details":
+            continue
+        box = header.find_parent("div", class_="box")
+        if box is None:
+            continue
+        for item in box.select("li.list-item"):
+            label_node = item.find("b")
+            if label_node is None:
+                continue
+            kind = _SOCIAL_LABELS.get(label_node.get_text(strip=True).rstrip(":").casefold())
+            if kind is None:
+                continue
+            anchor = item.find("a", href=True)
+            url = anchor["href"].strip() if anchor else ""
+            if not url.startswith("http"):
+                handle = item.get_text(" ", strip=True).split(":", 1)[-1].strip().lstrip("@")
+                if not handle:
+                    continue
+                url = _social_url(kind, handle)
+            if url in seen:
+                continue
+            seen.add(url)
+            found.append({"kind": kind, "url": url})
+    return found
+
+
+def _social_url(kind: str, handle: str) -> str:
+    bases = {
+        "instagram": "https://www.instagram.com/",
+        "x": "https://x.com/",
+        "tiktok": "https://www.tiktok.com/@",
+        "facebook": "https://www.facebook.com/",
+        "youtube": "https://www.youtube.com/@",
+        "weibo": "https://weibo.com/",
+        "threads": "https://www.threads.net/@",
+    }
+    return bases.get(kind, "") + handle
+
+
+def fetch_person_filmography(link: str | None) -> dict[str, list[dict]] | None:
+    if not link or "/people/" not in link:
+        return None
+    try:
+        response = cffi_requests.get(link, impersonate="chrome110", timeout=20)
+    except Exception:
+        return None
+    if response.status_code != 200 or "film-title" not in response.text:
+        return None
+    soup = BeautifulSoup(response.text, "html.parser")
+    found = {kind: [] for kind in _FILM_KINDS}
+    seen = {kind: set() for kind in _FILM_KINDS}
+    for header in soup.select("div.box-body > h5.header"):
+        kind = header.get_text(strip=True)
+        if kind not in found:
+            continue
+        table = header.find_next_sibling("table", class_="film-list")
+        if table is None:
+            continue
+        for row in table.select("tbody > tr"):
+            item = _film_row(row)
+            if item is None or item["slug"] in seen[kind]:
+                continue
+            seen[kind].add(item["slug"])
+            found[kind].append(item)
+    if not any(found.values()):
+        return None
+    return found
+
+
+def _film_row(row) -> dict | None:
+    cell = row.select_one("td.title")
+    link = cell.select_one("b a[href]") if cell else None
+    if link is None and cell is not None:
+        for anchor in cell.select("a[href]"):
+            if anchor.get_text(strip=True):
+                link = anchor
+                break
+    if link is None:
+        return None
+    title = link.get_text(strip=True) or (link.get("title") or "").strip()
+    slug = (link.get("href") or "").split("?", 1)[0].strip("/")
+    if not title or re.fullmatch(r"\d+-.+", slug) is None:
+        return None
+    year_el = row.select_one("td.year")
+    year_text = year_el.get_text(strip=True) if year_el else ""
+    year = int(year_text) if year_text.isdigit() else None
+    role_el = row.select_one("td.role > div.text-muted")
+    char_el = row.select_one("td.role > div.name")
+    rating_el = row.select_one("td.text-center > div.text-sm")
+    rating = None
+    if rating_el:
+        try:
+            rating = float(rating_el.get_text(strip=True))
+        except ValueError:
+            rating = None
+    character = char_el.get_text(strip=True) if char_el else ""
+    return {
+        "title": title,
+        "slug": slug,
+        "link": f"https://mydramalist.com/{slug}",
+        "year": year,
+        "episodes": None,
+        "rating": rating,
+        "role": role_el.get_text(strip=True) if role_el else "",
+        "character": character or None,
+    }
+
+
 def poster_map(body: dict) -> dict[str, DramaDetail | None]:
     data = body.get("data") if isinstance(body.get("data"), dict) else {}
     works = data.get("works") if isinstance(data.get("works"), dict) else {}
@@ -174,19 +505,204 @@ def fetch_drama_text(slug: str) -> DramaDetail | None:
         text_or_none(data.get("synopsis")),
         text_or_none(data.get("native_title")),
         [item.strip() for item in raw_tags if isinstance(item, str) and item.strip()],
+        network_names(data.get("original_network")),
+        aired_span(data.get("aired")),
+        detail_text(data.get("aired_on")),
+        content_code(data.get("content_rating")),
     )
+
+
+def detail_text(value: object) -> str | None:
+    if isinstance(value, list):
+        parts = [item.strip() for item in value if isinstance(item, str) and item.strip()]
+        return ", ".join(parts) or None
+    return text_or_none(value)
+
+
+_RATING = re.compile(r"^(\d+\+)")
+
+
+def content_code(value: object) -> str | None:
+    text = detail_text(value)
+    if text is None:
+        return None
+    text = text.strip()
+    if text == "G - All Ages":
+        return "전체관람가"
+    match = _RATING.match(text)
+    if match is None:
+        return text
+    return match.group(1)
+
+
+_AIR_DAY = re.compile(r"^([A-Za-z]+)\s+(\d{1,2}),\s*(\d{4})$")
+_AIR_RANGE = re.compile(r"^(.+?)\s+-\s+(.+)$")
+_MONTHS = {
+    "jan": 1,
+    "feb": 2,
+    "mar": 3,
+    "apr": 4,
+    "may": 5,
+    "jun": 6,
+    "jul": 7,
+    "aug": 8,
+    "sep": 9,
+    "oct": 10,
+    "nov": 11,
+    "dec": 12,
+}
+
+
+def aired_span(value: object) -> str | None:
+    text = detail_text(value)
+    if text is None:
+        return None
+    match = _AIR_RANGE.match(text.strip())
+    if match is None:
+        return text
+    start = _iso_day(match.group(1))
+    end = _iso_day(match.group(2))
+    if start is None or end is None:
+        return text
+    return f"{start} ~ {end}"
+
+
+def _iso_day(text: str) -> str | None:
+    match = _AIR_DAY.match(text.strip())
+    if match is None:
+        return None
+    month = _MONTHS.get(match.group(1).casefold()[:3])
+    if month is None:
+        return None
+    try:
+        return date(int(match.group(3)), month, int(match.group(2))).isoformat()
+    except ValueError:
+        return None
+
+
+def _rewrite_company_keys(conn: psycopg.Connection) -> None:
+    rows = conn.execute("SELECT id, name, name_key FROM company").fetchall()
+    for company_id, name, current in rows:
+        key = name_key(name)
+        if key and key != current:
+            conn.execute(
+                "UPDATE company SET name_key = %s WHERE id = %s",
+                (key, company_id),
+            )
+
+
+def _rewrite_aired(conn: psycopg.Connection) -> None:
+    rows = conn.execute(
+        "SELECT id, aired FROM work WHERE aired IS NOT NULL AND aired !~ '^[0-9]{4}-'"
+    ).fetchall()
+    for work_id, aired in rows:
+        formatted = aired_span(aired)
+        if formatted != aired:
+            conn.execute(
+                "UPDATE work SET aired = %s WHERE id = %s",
+                (formatted, work_id),
+            )
+
+
+def _rewrite_ratings(conn: psycopg.Connection) -> None:
+    rows = conn.execute(
+        "SELECT id, content_rating FROM work WHERE content_rating ~ '^[0-9]+\\+.' OR content_rating = 'G - All Ages'"
+    ).fetchall()
+    for work_id, rating in rows:
+        formatted = content_code(rating)
+        if formatted != rating:
+            conn.execute(
+                "UPDATE work SET content_rating = %s WHERE id = %s",
+                (formatted, work_id),
+            )
+
+
+def network_names(value: object) -> list[str]:
+    raw = value if isinstance(value, list) else []
+    names: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        if not isinstance(item, str):
+            continue
+        name = item.strip()
+        key = name_key(name)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        names.append(name)
+    return names
+
+
+def save_broadcasters(conn: psycopg.Connection, work_id: int, names: list[str]) -> None:
+    # ponytail: work_company is broadcast links only. Delete-all breaks once production links exist.
+    conn.execute("DELETE FROM work_company WHERE work_id = %s", (work_id,))
+    for name in names:
+        company_id = _upsert_company_name(conn, name)
+        conn.execute(
+            """
+            INSERT INTO company_type (company_id, org_type_id)
+            SELECT %s, id FROM org_type WHERE name = %s
+            ON CONFLICT DO NOTHING
+            """,
+            (company_id, NETWORK_TYPE),
+        )
+        conn.execute(
+            """
+            INSERT INTO work_company (work_id, company_id)
+            VALUES (%s, %s)
+            ON CONFLICT DO NOTHING
+            """,
+            (work_id, company_id),
+        )
+    conn.execute("UPDATE work SET networks_at = now() WHERE id = %s", (work_id,))
+
+
+def save_air(conn: psycopg.Connection, work_id: int, detail: DramaDetail) -> None:
+    conn.execute(
+        """
+        UPDATE work
+        SET aired = %s,
+            aired_on = %s,
+            content_rating = %s,
+            air_at = now()
+        WHERE id = %s
+        """,
+        (detail.aired, detail.aired_on, detail.content_rating, work_id),
+    )
+
+
+def _upsert_company_name(conn: psycopg.Connection, name: str) -> int:
+    key = name_key(name)
+    row = conn.execute(
+        "SELECT id FROM company WHERE name_key = %s ORDER BY id",
+        (key,),
+    ).fetchone()
+    if row:
+        return int(row[0])
+    created = conn.execute(
+        """
+        INSERT INTO company (name, name_key)
+        VALUES (%s, %s)
+        RETURNING id
+        """,
+        (name, key),
+    ).fetchone()
+    return int(created[0])
 
 
 def save_drama_detail(work_id: int) -> None:
     with connect() as conn:
         row = conn.execute(
-            "SELECT mdl_url, detail_at FROM work WHERE id = %s",
+            "SELECT mdl_url, detail_at, networks_at, air_at FROM work WHERE id = %s",
             (work_id,),
         ).fetchone()
-    if row is None or row[1] is not None:
+    if row is None:
         return
-    slug = drama_slug(row[0])
+    mdl_url, detail_at, networks_at, air_at = row
+    slug = drama_slug(mdl_url)
     if slug is None:
+        return
+    if detail_at is not None and networks_at is not None and air_at is not None:
         return
     detail = fetch_drama_text(slug)
     if detail is None:
@@ -204,22 +720,30 @@ def save_drama_detail(work_id: int) -> None:
             """,
             (detail.synopsis, detail.native_title, detail.tags, detail.image_url, work_id),
         )
+        save_broadcasters(conn, work_id, detail.networks)
+        save_air(conn, work_id, detail)
         conn.commit()
 
 
 def fill_drama_details() -> None:
     with connect() as conn:
         rows = conn.execute(
-            "SELECT id, mdl_url FROM work WHERE detail_at IS NULL AND mdl_url IS NOT NULL"
+            """
+            SELECT id, mdl_url, detail_at, networks_at, air_at FROM work
+            WHERE mdl_url IS NOT NULL
+              AND (detail_at IS NULL OR networks_at IS NULL OR air_at IS NULL)
+            """
         ).fetchall()
-    for work_id, mdl_url in rows:
+    for work_id, mdl_url, detail_at, networks_at, air_at in rows:
         slug = drama_slug(mdl_url)
         if slug is None:
+            continue
+        if detail_at is not None and networks_at is not None and air_at is not None:
             continue
         try:
             detail = fetch_drama_text(slug)
         except Exception:
-            continue
+            detail = None
         if detail is None:
             continue
         with connect() as conn:
@@ -235,6 +759,8 @@ def fill_drama_details() -> None:
                 """,
                 (detail.synopsis, detail.native_title, detail.tags, detail.image_url, work_id),
             )
+            save_broadcasters(conn, work_id, detail.networks)
+            save_air(conn, work_id, detail)
             conn.commit()
 
 
@@ -284,7 +810,7 @@ def save_success(
             alias_list,
             text_or_none(data.get("nationality")),
             text_or_none(data.get("gender")),
-            text_or_none(data.get("born")),
+            normalize_born(data.get("born")),
             text_or_none(data.get("image")),
             text_or_none(body.get("link")),
             person_id,
@@ -367,7 +893,7 @@ def upsert_work(
                 synopsis, native_title, tags, fetched, fetched, fetched,
             ),
         ).fetchone()
-        return int(row[0])
+        return _store_broadcasters(conn, int(row[0]), detail)
 
     row = conn.execute(
         """
@@ -398,7 +924,7 @@ def upsert_work(
                 fetched, tags or [], fetched, row[0],
             ),
         )
-        return int(row[0])
+        return _store_broadcasters(conn, int(row[0]), detail)
     row = conn.execute(
         """
         INSERT INTO work (
@@ -413,7 +939,18 @@ def upsert_work(
             synopsis, native_title, tags, fetched,
         ),
     ).fetchone()
-    return int(row[0])
+    return _store_broadcasters(conn, int(row[0]), detail)
+
+
+def _store_broadcasters(
+    conn: psycopg.Connection,
+    work_id: int,
+    detail: DramaDetail | None,
+) -> int:
+    if detail is not None:
+        save_broadcasters(conn, work_id, detail.networks)
+        save_air(conn, work_id, detail)
+    return work_id
 
 
 def _stage_before(full: str | None, given: str | None) -> str | None:
@@ -454,6 +991,13 @@ def given_and_stage(
     if len(parts) == 1:
         return head, None
     return " ".join(parts[1:]), parts[0]
+
+
+def _biography(value: object) -> str | None:
+    text = text_or_none(value)
+    if text and text.casefold() == "add biography":
+        return None
+    return text
 
 
 def text_or_none(value: object) -> str | None:
@@ -584,7 +1128,10 @@ def collect_credits(work_id: int) -> int:
             (work_id, list(CREDIT_ROLES)),
         )
         for item in collapse_credits(credits):
-            person_id = upsert_credit_person(conn, credit_profile(item, profiles.get(item["mdl_id"])))
+            profile = credit_profile(item, profiles.get(item["mdl_id"]))
+            profile["socials"] = fetch_person_socials(profile["mdl_url"])
+            person_id = upsert_credit_person(conn, profile)
+            grant_person_roles(conn, person_id, credit_role_codes(item["role"]))
             conn.execute(
                 """
                 INSERT INTO person_work (person_id, work_id, role)
@@ -672,11 +1219,11 @@ def move_credits(conn: psycopg.Connection) -> None:
             INSERT INTO person (
                 mdl_id, name, native_name, first_name, family_name, stage_name,
                 also_known_as, nationality, gender, born_text, image_url, mdl_url,
-                about, collect_status, collected_at, listed
+                about, collect_status, collected_at
             )
             SELECT mdl_id, name, native_name, first_name, family_name, stage_name,
                    also_known_as, nationality, gender, born_text, image_url, mdl_url,
-                   NULL, 'collected', now(), false
+                   NULL, 'collected', now()
             FROM {table}
             ON CONFLICT (mdl_id) DO NOTHING
             """
@@ -714,6 +1261,7 @@ def move_credits(conn: psycopg.Connection) -> None:
     conn.execute("DROP TABLE work_director")
     conn.execute("DROP TABLE screenwriter")
     conn.execute("DROP TABLE director")
+    _fill_person_roles(conn)
 
 
 def credit_profile(card: dict, body: dict | None) -> dict:
@@ -734,9 +1282,11 @@ def credit_profile(card: dict, body: dict | None) -> dict:
         "also_known_as": [item for item in aliases if isinstance(item, str)],
         "nationality": text_or_none(data.get("nationality")),
         "gender": text_or_none(data.get("gender")),
-        "born_text": text_or_none(data.get("born")),
+        "born_text": normalize_born(data.get("born")),
         "image_url": text_or_none(data.get("image")) or card.get("image_url"),
         "mdl_url": mdl_url or card.get("mdl_url"),
+        "about": _biography(data.get("about")),
+        "socials": [],
     }
 
 
@@ -746,9 +1296,9 @@ def upsert_credit_person(conn: psycopg.Connection, profile: dict) -> int:
         INSERT INTO person (
             mdl_id, name, native_name, first_name, family_name, stage_name,
             also_known_as, nationality, gender, born_text, image_url, about,
-            mdl_url, collect_status, collected_at, listed
+            socials, mdl_url, collect_status, collected_at
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, %s, 'collected', now(), false)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'collected', now())
         ON CONFLICT (mdl_id) DO UPDATE
         SET name = COALESCE(EXCLUDED.name, person.name),
             native_name = COALESCE(EXCLUDED.native_name, person.native_name),
@@ -763,8 +1313,16 @@ def upsert_credit_person(conn: psycopg.Connection, profile: dict) -> int:
             gender = COALESCE(EXCLUDED.gender, person.gender),
             born_text = COALESCE(EXCLUDED.born_text, person.born_text),
             image_url = COALESCE(EXCLUDED.image_url, person.image_url),
+            about = COALESCE(EXCLUDED.about, person.about),
+            socials = CASE
+                WHEN EXCLUDED.socials = '[]'::jsonb THEN person.socials
+                ELSE EXCLUDED.socials
+            END,
             mdl_url = COALESCE(EXCLUDED.mdl_url, person.mdl_url)
-        WHERE person.listed = false
+        WHERE NOT EXISTS (
+            SELECT 1 FROM person_role
+            WHERE person_id = person.id AND role_code = 'a'
+        )
         RETURNING id
         """,
         (
@@ -779,6 +1337,8 @@ def upsert_credit_person(conn: psycopg.Connection, profile: dict) -> int:
             profile["gender"],
             profile["born_text"],
             profile["image_url"],
+            profile["about"],
+            Json(profile.get("socials") or []),
             profile["mdl_url"],
         ),
     ).fetchone()
