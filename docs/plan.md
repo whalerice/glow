@@ -1,6 +1,6 @@
 # 태국 엔터 데이터 수집 설계
 
-문서의 줄기는 소스 목록이 아니라 **배우 등록 → 1차 수집**이다. 실행 방법, 테이블 컬럼, Docker Compose는 [storage/design.md](design.md)에 있다.
+문서의 줄기는 소스 목록이 아니라 **배우 등록 → 1차 수집**이다. 실행 방법, 테이블 컬럼, Docker Compose는 [docs/design.md](design.md)에 있다.
 
 위키(영어, 없으면 프랑스어), Sapphic Effect, TMDB 시청처·작품 홈페이지와 회사 로고는 지금 앱에 있다. 캘린더, 뉴스, 티켓은 아직 없다.
 
@@ -40,7 +40,7 @@ flowchart TD
 
 **작품·소속사 테이블에는 배우 id 컬럼이 없다.** 한 작품·한 회사에 배우가 여러 명이므로, 배우 FK를 `work` / `company`에 두면 한 명만 남는다. 배우 id FK는 연결 테이블 행에만 있다. 배우가 늘면 작품/회사 행을 복제하지 않고 연결 행만 추가한다.
 
-- `person.id`, `work.id`, `company.id`: 각자 독립 대리키. 구현은 `bigint` identity. [storage/design.md](design.md)
+- `person.id`, `work.id`, `company.id`: 각자 독립 대리키. 구현은 `bigint` identity. [docs/design.md](design.md)
 - `work` upsert 키는 작품의 MDL 숫자 id다. 숫자 id가 없으면 제목+연도+종류. 이미 있으면 그 `work.id`를 재사용한다
 - `company` upsert 키는 정규화한 `name_key`다
 - 연결 테이블이 다대다를 만든다. 여기의 `person_id`가 배우 FK다
@@ -86,6 +86,6 @@ Where to Watch와 TV Show는 읽지 않는다. kuryana가 Drama 표를 하나만
 
 ## 범위 밖
 
-- SQL DDL, 마이그레이션, 스케줄러 코드. 컬럼 목록은 [storage/design.md](design.md)
+- SQL DDL, 마이그레이션, 스케줄러 코드. 컬럼 목록은 [docs/design.md](design.md)
 - 크롤러 셀렉터, Cloudflare 우회
 - 1차 플로우에 캘린더·뉴스·티켓을 끼워 넣는 설계

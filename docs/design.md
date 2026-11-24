@@ -1,6 +1,6 @@
 # 1차 구현 설계
 
-기준은 [storage/plan.md](plan.md)의 배우 등록 → 1차 수집이다. 이 문서는 그 흐름을 PostgreSQL과 Python으로 어떻게 실행할지 정한다.
+기준은 [docs/plan.md](plan.md)의 배우 등록 → 1차 수집이다. 이 문서는 그 흐름을 PostgreSQL과 Python으로 어떻게 실행할지 정한다. 화면은 [docs/hub.md](hub.md)의 hub가 그린다. storage serve는 JSON API다.
 
 ## 1차 범위
 
@@ -56,7 +56,7 @@ flowchart TD
   fetchPerson -->|HTTP 실패 또는 success false| markFailed[status failed]
 ```
 
-Compose 파일은 `storage/docker-compose.yml`이다. 아래 명령은 `storage`에서 실행한다. 인자는 이름 없는 숫자 id다.
+Compose 파일은 glow 루트의 `docker-compose.yml`이다. 아래 명령은 루트에서 실행한다. 인자는 이름 없는 숫자 id다.
 
 ```bash
 docker compose run --rm app register 70935
@@ -264,11 +264,12 @@ MDL `original_network`가 이 연결이다. 그 작품의 연결은 응답으로
 
 ## Docker Compose
 
-서비스는 셋이다.
+서비스는 넷이다.
 
 - `postgres`: 공식 PostgreSQL 이미지. 데이터는 named volume. 앱이 붙기 전에 healthy여야 한다. 호스트 포트는 `5433`.
 - `web`: 상시 서버. 호스트 포트는 `8000`. 기동 때 스키마를 맞춘다.
-- `app`: 수집 CLI. 상시 서버가 아니다. `storage`에서 `docker compose run --rm app register 70935`로 한 번 실행하고 끝난다. `postgres` healthy 이후에 시작한다.
+- `app`: 수집 CLI. 상시 서버가 아니다. glow 루트에서 `docker compose run --rm app register 70935`로 한 번 실행하고 끝난다. `postgres` healthy 이후에 시작한다.
+- `hub`: 화면. 호스트 포트는 `3300`. API 주소는 서비스 이름이 아니라 호스트의 `8000`이다.
 
 `register` 뒤의 값은 배우 이름이 아니다. MDL 숫자 id다.
 

@@ -18,30 +18,41 @@ services:
       - "5433:5432"
 
   app:
-    build: .
+    build: ./storage
     profiles: ["collect"]
     depends_on:
       postgres:
         condition: service_healthy
     env_file:
-      - .env
+      - ./storage/.env
     environment:
       DATABASE_URL: postgresql://glow:glow@postgres:5432/glow
       KURYANA_BASE_URL: https://kuryana.tbdh.app
 
   web:
-    build: .
+    build: ./storage
     ports:
       - "8000:8000"
     depends_on:
       postgres:
         condition: service_healthy
     env_file:
-      - .env
+      - ./storage/.env
     environment:
       DATABASE_URL: postgresql://glow:glow@postgres:5432/glow
       KURYANA_BASE_URL: https://kuryana.tbdh.app
     command: ["serve"]
+
+  hub:
+    build: ./hub
+    ports:
+      - "3300:3000"
+    environment:
+      NUXT_STORAGE_URL: http://host.docker.internal:8000
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - web
 
 volumes:
   pgdata:

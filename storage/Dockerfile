@@ -7,6 +7,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY sql ./sql
 COPY app ./app
-COPY templates ./templates
 
 ENTRYPOINT ["python", "-m", "app"]
