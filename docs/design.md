@@ -39,7 +39,7 @@ MDL 인물 주소는 `https://mydramalist.com/people/70935-freen-sarocha-chankim
 
 PostgreSQL. 언어는 Python. 이 수집기는 HTTP JSON을 받아 PostgreSQL에 넣는 작업이라 Python이 맞다.
 
-실행은 웹과 CLI다. Docker Compose로 `postgres`, 웹, 수집 CLI를 올린다.
+실행은 JSON API, 화면, CLI다. Docker Compose로 `postgres`, `storage`, `hub`, 수집 CLI `app`을 올린다. 화면 포트와 API 표는 [docs/hub.md](hub.md)에 있다.
 
 MDL 소스는 kuryana (`tbdsux/kuryana`)의 공개 호스트다. `B1PL0/MyDramaList-Unofficial-API`는 쓰지 않는다. 앱은 kuryana를 HTTP로만 호출한다. kuryana 자체 호스팅은 1차 범위 밖이다.
 
@@ -267,22 +267,22 @@ MDL `original_network`가 이 연결이다. 그 작품의 연결은 응답으로
 서비스는 넷이다.
 
 - `postgres`: 공식 PostgreSQL 이미지. 데이터는 named volume. 앱이 붙기 전에 healthy여야 한다. 호스트 포트는 `5433`.
-- `web`: 상시 서버. 호스트 포트는 `8000`. 기동 때 스키마를 맞춘다.
+- `storage`: JSON API. 호스트 포트는 `8000`. 기동 때 스키마를 맞춘다.
 - `app`: 수집 CLI. 상시 서버가 아니다. glow 루트에서 `docker compose run --rm app register 70935`로 한 번 실행하고 끝난다. `postgres` healthy 이후에 시작한다.
 - `hub`: 화면. 호스트 포트는 `3300`. API 주소는 서비스 이름이 아니라 호스트의 `8000`이다.
 
 `register` 뒤의 값은 배우 이름이 아니다. MDL 숫자 id다.
 
-앱 컨테이너의 DB는 Compose 네트워크의 `postgres`를 본다. kuryana는 컨테이너 밖 HTTP다. Compose 안에 kuryana 서비스를 넣지 않는다.
+`storage`와 `app`의 DB는 Compose 네트워크의 `postgres`를 본다. hub는 DB에 붙지 않는다. API는 호스트에 열린 `8000`을 본다. kuryana는 컨테이너 밖 HTTP다. Compose 안에 kuryana 서비스를 넣지 않는다.
 
-이미지 빌드는 `app` 서비스의 build 한 줄로만 적는다. Dockerfile 내용은 이 문서에 두지 않는다.
+이미지는 둘이다. `storage/Dockerfile`은 API와 CLI가 같이 쓴다. `hub/Dockerfile`은 화면이고 컨테이너 포트는 `3300`이다.
 
 ## 환경변수
 
 - `DATABASE_URL`: 앱이 쓰는 PostgreSQL URL. Compose가 `postgres` 서비스 기준으로 넣는다.
 - `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`: `postgres` 서비스 초기화용.
 - `KURYANA_BASE_URL`: 기본값 `https://kuryana.tbdh.app`. 끝 슬래시 없이 쓴다. 인물 조회는 `{KURYANA_BASE_URL}/v2/people/{id}`다.
-- `tmdb_access_token_auth`: TMDB API 읽기 토큰. `storage/.env`. 웹과 CLI 컨테이너에 넣는다.
+- `tmdb_access_token_auth`: TMDB API 읽기 토큰. `storage/.env`. `storage`와 `app` 컨테이너에 넣는다.
 - `HTTP_USER_AGENT`: 위키와 GMMTV 위키, Sapphic Effect 요청 이름. 없으면 `glow-collect/0.1`.
 
 ## 범위 밖

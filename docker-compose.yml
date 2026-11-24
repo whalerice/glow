@@ -29,7 +29,7 @@ services:
       DATABASE_URL: postgresql://glow:glow@postgres:5432/glow
       KURYANA_BASE_URL: https://kuryana.tbdh.app
 
-  web:
+  storage:
     build: ./storage
     ports:
       - "8000:8000"
@@ -46,13 +46,13 @@ services:
   hub:
     build: ./hub
     ports:
-      - "3300:3000"
+      - "3300:3300"
     environment:
       NUXT_STORAGE_URL: http://host.docker.internal:8000
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
-      - web
+      - storage
 
 volumes:
   pgdata:

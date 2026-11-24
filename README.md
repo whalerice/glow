@@ -7,11 +7,13 @@
 - [plan.md](docs/plan.md) — 수집 흐름
 - [design.md](docs/design.md) — 테이블, upsert, 환경변수
 - [apis.md](docs/apis.md) — 외부 API
-- [hub.md](docs/hub.md) — 화면을 hub로 옮기는 구현 계획
+- [hub.md](docs/hub.md) — 화면, 포트, JSON API
 
-## 화면
+## 실행
 
-glow 루트에서 띄운다. hub는 호스트에 열린 `8000`을 본다.
+필요: Docker, Docker Compose. 명령은 glow 루트에서 실행한다.
+
+`hub`를 띄우면 `postgres`와 `storage`가 같이 올라간다. `storage`는 JSON API라서 꺼 두면 화면이 데이터를 못 받는다. HTML은 없다.
 
 ```bash
 docker compose up --build -d hub
@@ -19,31 +21,13 @@ docker compose up --build -d hub
 
 - 화면: http://127.0.0.1:3300/people
 - API: http://127.0.0.1:8000/api/people
-
-로컬 화면은 `hub`에서 `pnpm install` 후 `pnpm dev`. http://127.0.0.1:3000/people
-
-## storage 실행
-
-필요: Docker, Docker Compose.
-
-명령은 glow 루트에서 실행한다.
-
-### DB와 API
-
-`web`이 `postgres` healthy 이후 `serve`로 뜬다. 기동 시 스키마를 적용한다. HTML은 없다.
-
-```bash
-docker compose up --build web
-```
-
-- API: http://localhost:8000/api/people
 - PostgreSQL: `localhost:5433`
 - 계정: user `glow` / password `glow` / database `glow`
 
-백그라운드:
+API만 켤 때:
 
 ```bash
-docker compose up --build -d web
+docker compose up --build -d storage
 ```
 
 중지. 데이터 볼륨 `pgdata`는 남긴다.
@@ -53,6 +37,8 @@ docker compose down
 ```
 
 볼륨까지 지우려면 `docker compose down -v`.
+
+로컬 화면은 `hub`에서 `pnpm install` 후 `pnpm dev`다. http://127.0.0.1:3000/people . storage API가 `8000`에 떠 있어야 한다.
 
 ### CLI 수집
 
@@ -70,8 +56,8 @@ docker compose run --rm app register 70935
 
 Compose가 넣는다. 로컬에서 덮어쓸 때만 바꾼다.
 
-| 이름 | 값 |
-| --- | --- |
-| `DATABASE_URL` | `postgresql://glow:glow@postgres:5432/glow` |
-| `KURYANA_BASE_URL` | `https://kuryana.tbdh.app` |
-| `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | `glow` |
+| 이름                                                  | 값                                          |
+| ----------------------------------------------------- | ------------------------------------------- |
+| `DATABASE_URL`                                        | `postgresql://glow:glow@postgres:5432/glow` |
+| `KURYANA_BASE_URL`                                    | `https://kuryana.tbdh.app`                  |
+| `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | `glow`                                      |
