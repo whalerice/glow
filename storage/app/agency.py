@@ -1,6 +1,7 @@
 import re
 
 import psycopg
+from psycopg.types.json import Json
 
 _RANGE = re.compile(r"\(([^)]*)\)\s*$")
 _YEAR = re.compile(r"(\d{4})\s*[–—-]\s*(\d{4}|present)", re.I)
@@ -12,7 +13,7 @@ _SLUG = re.compile(r"^[a-z0-9-]+$")
 def name_key(name: str) -> str:
     text = name.casefold()
     text = re.sub(r"[^0-9a-z\uac00-\ud7a3\u0e00-\u0e7f]+", " ", text)
-    return " ".join(text.split())
+    return "_".join(text.split())
 
 
 def parse_agent(text: str) -> list[dict]:
@@ -58,12 +59,24 @@ def parse_agent(text: str) -> list[dict]:
     return spells
 
 
-def save_sapphic_company(conn: psycopg.Connection, person_id: int, company: dict) -> None:
+def save_sapphic_company(
+    conn: psycopg.Connection,
+    person_id: int,
+    company: dict,
+) -> None:
     name = str(company.get("name") or "").strip()
     slug = str(company.get("slug") or "").strip().lower()
     if not name or not name_key(name) or not _SLUG.fullmatch(slug):
         return
     company_id = _upsert_company(conn, name, slug)
+    conn.execute(
+        """
+        INSERT INTO company_type (company_id, org_type_id)
+        SELECT %s, id FROM org_type WHERE name = '엔터테이먼트'
+        ON CONFLICT DO NOTHING
+        """,
+        (company_id,),
+    )
     conn.execute(
         """
         UPDATE person_company
@@ -134,6 +147,39 @@ def backfill_sapphic(conn: psycopg.Connection) -> None:
         company = payload.get("company") if isinstance(payload, dict) else None
         if isinstance(company, dict):
             save_sapphic_company(conn, int(person_id), company)
+    _fill_sapphic_pages(conn)
+
+
+def _fill_sapphic_pages(conn: psycopg.Connection) -> None:
+    from app.sapphic import fetch_star
+
+    rows = conn.execute(
+        """
+        SELECT person_id, external_key, payload
+        FROM person_source
+        WHERE source = 'sapphic_effect'
+        """
+    ).fetchall()
+    for person_id, slug, payload in rows:
+        if not isinstance(payload, dict) or payload.get("biography"):
+            continue
+        try:
+            profile = fetch_star(str(slug))
+        except Exception:
+            continue
+        biography = profile.get("biography")
+        if not biography:
+            continue
+        updated = dict(payload)
+        updated["biography"] = biography
+        conn.execute(
+            """
+            UPDATE person_source
+            SET payload = %s
+            WHERE person_id = %s AND source = 'sapphic_effect'
+            """,
+            (Json(updated), person_id),
+        )
 
 
 def _upsert_company(conn: psycopg.Connection, name: str, slug: str | None) -> int:

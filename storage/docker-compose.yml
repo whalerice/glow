@@ -23,6 +23,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    env_file:
+      - .env
     environment:
       DATABASE_URL: postgresql://glow:glow@postgres:5432/glow
       KURYANA_BASE_URL: https://kuryana.tbdh.app
@@ -34,6 +36,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    env_file:
+      - .env
     environment:
       DATABASE_URL: postgresql://glow:glow@postgres:5432/glow
       KURYANA_BASE_URL: https://kuryana.tbdh.app

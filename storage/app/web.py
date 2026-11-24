@@ -1,8 +1,10 @@
 import html
+import json
 import re
 import urllib.error
+import urllib.request
 from datetime import datetime
-from threading import Thread
+from threading import Lock, Thread
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlparse
@@ -17,9 +19,15 @@ from app.fandom import fetch_page, search as fandom_search, selected_payload as 
 from app.sapphic import SOURCE, fetch_star, search, selected_payload
 from app.wikipedia import SOURCE as WIKI_SOURCE
 from app.wikipedia import fetch_page as fetch_wiki
+from app.tmdb import save_tmdb
 from app.wikipedia import gaps, search as wiki_search, selected_payload as wiki_payload
 
 TEMPLATES = Path(__file__).resolve().parent.parent / "templates"
+_WORK_REFRESH = False
+_WORK_DONE = 0
+_WORK_TOTAL = 0
+_WORK_NAME = ""
+_WORK_REFRESH_LOCK = Lock()
 KIND_LABEL = {"drama": "드라마", "movie": "영화", "tv_show": "TV 쇼"}
 CREDIT_LABEL = {
     "Screenwriter & Director": "작가·감독",
@@ -56,17 +64,26 @@ class Handler(BaseHTTPRequestHandler):
         work = re.fullmatch(r"/works/(\d+)", path.path)
         credit = re.fullmatch(r"/credits/(\d+)", path.path)
         company = re.fullmatch(r"/companies/(\d+)", path.path)
+        if path.path == "/people/works/progress":
+            payload = json.dumps(work_progress_payload(), ensure_ascii=False).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
         if path.path in ("/", "/people"):
             self.respond(page("배우", people_body()))
             return
         if path.path == "/works":
-            self.respond(page("작품", works_body()))
+            mode = parse_qs(path.query).get("deleted", ["0"])[0]
+            self.respond(page("작품", works_body(mode)))
             return
         if path.path == "/credits":
             self.respond(page("작가·감독", credits_body()))
             return
         if path.path == "/companies":
-            self.respond(page("소속사", companies_body()))
+            self.respond(page("종합 콘텐츠 스튜디오", companies_body()))
             return
         if path.path == "/register":
             error = parse_qs(path.query).get("error", [""])[0]
@@ -106,7 +123,7 @@ class Handler(BaseHTTPRequestHandler):
             if body is None:
                 self.respond(page("없는 배우", "<p class='text-sm text-stone-600'>없는 배우입니다.</p>"), 404)
                 return
-            self.respond(page("영어 위키 검색", body))
+            self.respond(page("위키 검색", body))
             return
         if person:
             body = person_body(int(person.group(1)))
@@ -131,11 +148,12 @@ class Handler(BaseHTTPRequestHandler):
             self.respond(page("작품", body))
             return
         if company:
-            body = company_body(int(company.group(1)))
+            error = parse_qs(path.query).get("error", [""])[0]
+            body = company_body(int(company.group(1)), error)
             if body is None:
-                self.respond(page("없는 소속사", "<p class='text-sm text-stone-600'>없는 소속사입니다.</p>"), 404)
+                self.respond(page("없는 종합 콘텐츠 스튜디오", "<p class='text-sm text-stone-600'>없는 종합 콘텐츠 스튜디오입니다.</p>"), 404)
                 return
-            self.respond(page("소속사", body))
+            self.respond(page("종합 콘텐츠 스튜디오", body))
             return
         self.respond(page("없음", "<p class='text-sm text-stone-600'>없는 화면입니다.</p>"), 404)
 
@@ -150,7 +168,7 @@ class Handler(BaseHTTPRequestHandler):
             person_id = int(wiki.group(1))
             title = form.get("title", [""])[0]
             try:
-                save_wiki(person_id, title, form.get("fields", []))
+                save_wiki(person_id, title, form.get("fields", []), form.get("lang", ["en"])[0])
             except ValueError as exc:
                 self.redirect(f"/people/{person_id}/wiki?error=" + quote(str(exc)))
                 return
@@ -176,9 +194,53 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self.redirect(f"/people/{person_id}")
             return
+        deleted = re.fullmatch(r"/people/(\d+)/delete", parsed.path)
+        if deleted:
+            if not delete_person(int(deleted.group(1))):
+                self.respond(page("없는 배우", "<p class='text-sm text-stone-600'>없는 배우입니다.</p>"), 404)
+                return
+            self.redirect("/people")
+            return
+        if parsed.path == "/people/works":
+            start_work_refresh()
+            self.redirect("/people")
+            return
+        company = re.fullmatch(r"/companies/(\d+)", parsed.path)
+        if company:
+            company_id = int(company.group(1))
+            try:
+                save_company_urls(
+                    company_id,
+                    form.get("logo_url", [""])[0],
+                    form.get("homepage", [""])[0],
+                )
+            except ValueError as exc:
+                self.redirect(f"/companies/{company_id}?error=" + quote(str(exc)))
+                return
+            self.redirect(f"/companies/{company_id}")
+            return
         if parsed.path != "/register":
             episode = re.fullmatch(r"/works/(\d+)/episodes", parsed.path)
             credit = re.fullmatch(r"/works/(\d+)/credits", parsed.path)
+            tmdb = re.fullmatch(r"/works/(\d+)/tmdb", parsed.path)
+            exception = re.fullmatch(r"/works/(\d+)/exception", parsed.path)
+            if exception:
+                work_id = int(exception.group(1))
+                hide_work(work_id)
+                mode = form.get("deleted", ["0"])[0]
+                if mode not in ("all", "0", "1"):
+                    mode = "0"
+                self.redirect("/works?deleted=" + mode)
+                return
+            if tmdb:
+                work_id = int(tmdb.group(1))
+                try:
+                    save_tmdb(work_id, form.get("tmdb_id", [""])[0], form.get("tmdb_kind", [""])[0])
+                except ValueError as exc:
+                    self.redirect(f"/works/{work_id}?error=" + quote(str(exc)))
+                    return
+                self.redirect(f"/works/{work_id}")
+                return
             if credit:
                 work_id = int(credit.group(1))
                 try:
@@ -237,27 +299,47 @@ def register_body(error: str) -> str:
     return fragment.replace("{{error}}", message)
 
 
-def people_body() -> str:
+def _listed_people() -> list[dict]:
     with connect() as conn:
         conn.row_factory = dict_row
-        rows = conn.execute(
+        return conn.execute(
             """
             SELECT p.id, p.mdl_id, p.name, p.native_name, p.nationality,
                    p.image_url, p.collect_status, p.collected_at,
-                   (SELECT count(*) FROM person_work pw
-                    WHERE pw.person_id = p.id AND NOT (pw.role = ANY(%s))) AS works
+                   c.works, c.hidden
             FROM person p
-            WHERE p.listed
+            LEFT JOIN LATERAL (
+              SELECT count(*) FILTER (WHERE w.deleted = 0) AS works,
+                     count(*) FILTER (WHERE w.deleted = 1) AS hidden
+              FROM person_work pw
+              JOIN work w ON w.id = pw.work_id
+              WHERE pw.person_id = p.id
+                AND NOT (pw.role = ANY(%s))
+            ) c ON true
+            WHERE EXISTS (
+              SELECT 1 FROM person_role pr
+              WHERE pr.person_id = p.id AND pr.role_code = 'a'
+            )
             ORDER BY p.id DESC
             """,
             (list(CREDIT_ROLES),),
         ).fetchall()
+
+
+def people_body() -> str:
+    rows = _listed_people()
     if not rows:
-        return """
+        return f"""
         <section class="rounded-lg border border-stone-200 bg-white p-6">
           <h1 class="text-xl font-semibold">배우 <span class="text-stone-400">0</span></h1>
           <p class="mt-2 text-sm text-stone-600">등록된 배우가 없습니다.</p>
-          <a href="/register" class="mt-4 inline-block text-sm font-medium text-stone-900 underline">배우 등록</a>
+          <div class="mt-4 flex items-center gap-2">
+            {work_refresh_note()}
+            <form method="post" action="/people/works">
+              <button class="rounded-md border border-stone-300 px-3 py-2 text-sm font-medium">작품 가져오기</button>
+            </form>
+            <a href="/register" class="text-sm font-medium text-stone-900 underline">배우 등록</a>
+          </div>
         </section>
         """
     items = "\n".join(person_row(row) for row in rows)
@@ -265,7 +347,13 @@ def people_body() -> str:
     <section>
       <div class="mb-4 flex items-end justify-between">
         <h1 class="text-xl font-semibold">배우 <span class="text-stone-400">{len(rows)}</span></h1>
-        <a href="/register" class="rounded-md bg-stone-900 px-3 py-2 text-sm font-medium text-white">배우 등록</a>
+        <div class="flex items-center gap-2">
+          {work_refresh_note()}
+          <form method="post" action="/people/works">
+            <button class="rounded-md border border-stone-300 px-3 py-2 text-sm font-medium">작품 가져오기</button>
+          </form>
+          <a href="/register" class="rounded-md bg-stone-900 px-3 py-2 text-sm font-medium text-white">배우 등록</a>
+        </div>
       </div>
       <div class="overflow-hidden rounded-lg border border-stone-200 bg-white">
         <table class="w-full text-left text-sm">
@@ -300,9 +388,9 @@ def person_row(row: dict) -> str:
       <td class="px-4 py-3"><a class="font-medium" href="/people/{row['id']}">{esc(name)}</a>{sub}</td>
       <td class="px-4 py-3">{esc(row['mdl_id'])}</td>
       <td class="px-4 py-3">{esc(row['nationality'] or '')}</td>
-      <td class="px-4 py-3">{status_badge(row['collect_status'])}</td>
-      <td class="px-4 py-3">{int(row['works'])}</td>
-      <td class="px-4 py-3 text-stone-500">{esc(stamp(row['collected_at']))}</td>
+      <td class="px-4 py-3" data-status="{row['id']}">{status_badge(row['collect_status'])}</td>
+      <td class="px-4 py-3" data-works="{row['id']}">{_works_count(row)}</td>
+      <td class="px-4 py-3 text-stone-500" data-at="{row['id']}">{esc(stamp(row['collected_at']))}</td>
     </tr>
     """
 
@@ -331,11 +419,15 @@ def person_body(person_id: int) -> str | None:
                    pw.role, pw.character_name
             FROM person_work pw
             JOIN work w ON w.id = pw.work_id
-            WHERE pw.person_id = %s AND NOT (pw.role = ANY(%s))
+            WHERE pw.person_id = %s AND w.deleted = 0 AND NOT (pw.role = ANY(%s))
             ORDER BY w.year DESC NULLS LAST, w.title
             """,
             (person_id, list(CREDIT_ROLES)),
         ).fetchall()
+        actor = conn.execute(
+            "SELECT 1 FROM person_role WHERE person_id = %s AND role_code = 'a'",
+            (person_id,),
+        ).fetchone()
         affiliations = conn.execute(
             """
             SELECT c.id AS company_id, c.name, pc.start_year, pc.end_year,
@@ -358,6 +450,13 @@ def person_body(person_id: int) -> str | None:
     work_rows = "\n".join(work_row(row) for row in works) or """
       <tr><td class='px-4 py-6 text-stone-500' colspan='6'>출연작이 없습니다.</td></tr>
     """
+    delete = ""
+    if actor:
+        delete = f"""
+        <form method="post" action="/people/{person_id}/delete" onsubmit="return confirm('이 배우와 연결을 삭제합니다. 작품과 소속사는 남습니다.')">
+          <button class="rounded-md border border-red-300 px-2 py-1 text-xs font-medium text-red-700">삭제</button>
+        </form>
+        """
     return f"""
     <a href="/people" class="text-sm text-stone-500 hover:text-stone-900">배우</a>
     <section class="mt-3 rounded-lg border border-stone-200 bg-white p-6">
@@ -367,6 +466,7 @@ def person_body(person_id: int) -> str | None:
           <div class="flex items-center gap-2">
             <h1 class="text-2xl font-semibold">{esc(person['name'] or '이름 없음')}</h1>
             {status_badge(person['collect_status'])}
+            {delete}
           </div>
           <p class="mt-1 text-stone-600">{esc(person['native_name'] or '')}</p>
           {source_line(person)}
@@ -423,30 +523,33 @@ def work_row(row: dict) -> str:
     """
 
 
-def works_body() -> str:
+def works_body(mode: str) -> str:
+    if mode not in ("all", "0", "1"):
+        mode = "0"
+    where = {"all": "", "0": "WHERE w.deleted = 0", "1": "WHERE w.deleted = 1"}[mode]
     with connect() as conn:
         conn.row_factory = dict_row
         rows = conn.execute(
-            """
-            SELECT w.id, w.title, w.kind, w.year, w.episodes, w.rating, w.image_url, w.tags,
+            f"""
+            SELECT w.id, w.title, w.kind, w.year, w.episodes, w.rating, w.image_url, w.tags, w.deleted,
                    (SELECT count(*) FROM person_work pw
                     WHERE pw.work_id = w.id AND NOT (pw.role = ANY(%s))) AS cast_count
             FROM work w
+            {where}
             ORDER BY w.year DESC NULLS LAST, w.title
             """,
             (list(CREDIT_ROLES),),
         ).fetchall()
+    items = "\n".join(work_list_row(row, mode) for row in rows)
+    empty = ""
     if not rows:
-        return """
-        <section class="rounded-lg border border-stone-200 bg-white p-6">
-          <h1 class="text-xl font-semibold">작품</h1>
-          <p class="mt-2 text-sm text-stone-600">수집된 작품이 없습니다.</p>
-        </section>
-        """
-    items = "\n".join(work_list_row(row) for row in rows)
+        empty = "<p class='border-t border-stone-200 px-4 py-6 text-sm text-stone-600'>수집된 작품이 없습니다.</p>"
     return f"""
     <section>
-      <h1 class="mb-4 text-xl font-semibold">작품</h1>
+      <div class="mb-4 flex items-end justify-between">
+        <h1 class="text-xl font-semibold">작품</h1>
+        {work_filter(mode)}
+      </div>
       <div class="overflow-hidden rounded-lg border border-stone-200 bg-white">
         <table class="w-full text-left text-sm">
           <thead class="border-b border-stone-200 bg-stone-50 text-stone-500">
@@ -458,27 +561,183 @@ def works_body() -> str:
               <th class="px-4 py-3 font-medium">에피소드</th>
               <th class="px-4 py-3 font-medium">평점</th>
               <th class="px-4 py-3 font-medium">출연</th>
+              <th class="px-4 py-3 font-medium"></th>
             </tr>
           </thead>
           <tbody>{items}</tbody>
         </table>
+        {empty}
       </div>
     </section>
     """
 
 
-def work_list_row(row: dict) -> str:
+def work_filter(mode: str) -> str:
+    options = (("all", "All"), ("0", "Show"), ("1", "Hide"))
+    tags = []
+    for value, label in options:
+        selected = " selected" if value == mode else ""
+        tags.append(f"<option value='{value}'{selected}>{label}</option>")
+    return f"""
+    <form method="get" action="/works">
+      <select name="deleted" onchange="this.form.submit()" class="rounded-md border border-stone-300 bg-white px-2 py-2 text-sm">
+        {"".join(tags)}
+      </select>
+    </form>
+    """
+
+
+def delete_person(person_id: int) -> bool:
+    with connect() as conn:
+        actor = conn.execute(
+            "SELECT 1 FROM person_role WHERE person_id = %s AND role_code = 'a'",
+            (person_id,),
+        ).fetchone()
+        if actor is None:
+            return False
+        conn.execute("DELETE FROM person_work WHERE person_id = %s", (person_id,))
+        conn.execute("DELETE FROM person_source WHERE person_id = %s", (person_id,))
+        conn.execute("DELETE FROM person_company WHERE person_id = %s", (person_id,))
+        conn.execute("DELETE FROM person_ship WHERE person_id = %s", (person_id,))
+        conn.execute(
+            """
+            DELETE FROM ship
+            WHERE NOT EXISTS (
+              SELECT 1 FROM person_ship WHERE person_ship.ship_id = ship.id
+            )
+            """
+        )
+        conn.execute("DELETE FROM person_role WHERE person_id = %s", (person_id,))
+        conn.execute("DELETE FROM person WHERE id = %s", (person_id,))
+        conn.commit()
+    return True
+
+
+def hide_work(work_id: int) -> None:
+    with connect() as conn:
+        conn.execute("UPDATE work SET deleted = 1 WHERE id = %s", (work_id,))
+        conn.commit()
+
+
+def start_work_refresh() -> None:
+    global _WORK_REFRESH, _WORK_DONE, _WORK_TOTAL, _WORK_NAME
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT p.mdl_id, COALESCE(NULLIF(p.name, ''), p.mdl_id)
+            FROM person p
+            WHERE EXISTS (
+              SELECT 1 FROM person_role pr
+              WHERE pr.person_id = p.id AND pr.role_code = 'a'
+            )
+            ORDER BY p.id
+            """
+        ).fetchall()
+    with _WORK_REFRESH_LOCK:
+        if _WORK_REFRESH or not rows:
+            return
+        _WORK_REFRESH = True
+        _WORK_DONE = 0
+        _WORK_TOTAL = len(rows)
+        _WORK_NAME = rows[0][1]
+    Thread(target=_refresh_listed_works, args=(rows,), daemon=True).start()
+
+
+def _refresh_listed_works(rows: list) -> None:
+    global _WORK_REFRESH, _WORK_DONE, _WORK_NAME
+    try:
+        for index, (mdl_id, name) in enumerate(rows):
+            with _WORK_REFRESH_LOCK:
+                _WORK_NAME = name
+                _WORK_DONE = index
+            try:
+                register(str(mdl_id))
+            except Exception:
+                continue
+        with _WORK_REFRESH_LOCK:
+            _WORK_DONE = len(rows)
+    finally:
+        with _WORK_REFRESH_LOCK:
+            _WORK_REFRESH = False
+
+
+def _works_count(row: dict) -> str:
+    return f"{int(row['works'] or 0)}<span class='text-stone-500'>({int(row['hidden'] or 0)})</span>"
+
+
+def _work_bar(done: int, total: int, name: str) -> str:
+    pct = 0 if total == 0 else int(done * 100 / total)
+    return f"""
+    <p class="text-xs text-stone-500">작품 {done}/{total} · {esc(name)}</p>
+    <div class="mt-1 h-1.5 w-40 overflow-hidden rounded bg-stone-200">
+      <div class="h-full bg-stone-900" style="width:{pct}%"></div>
+    </div>
+    """
+
+
+def work_progress_payload() -> dict:
+    with _WORK_REFRESH_LOCK:
+        on = _WORK_REFRESH
+        done, total, name = _WORK_DONE, _WORK_TOTAL, _WORK_NAME
+    rows = [
+        {
+            "id": row["id"],
+            "works": _works_count(row),
+            "status": status_badge(row["collect_status"]),
+            "at": stamp(row["collected_at"]),
+        }
+        for row in _listed_people()
+    ]
+    return {"on": on, "html": _work_bar(done, total, name) if on else "", "rows": rows}
+
+
+def work_refresh_note() -> str:
+    with _WORK_REFRESH_LOCK:
+        if not _WORK_REFRESH:
+            return ""
+        done, total, name = _WORK_DONE, _WORK_TOTAL, _WORK_NAME
+    return f"""
+    <div id="work-progress" class="min-w-40">{_work_bar(done, total, name)}</div>
+    <script>
+    async function workTick() {{
+      const data = await (await fetch("/people/works/progress")).json();
+      const box = document.getElementById("work-progress");
+      if (box) {{
+        if (data.html) box.innerHTML = data.html;
+        else box.remove();
+      }}
+      for (const row of data.rows) {{
+        const works = document.querySelector('[data-works="' + row.id + '"]');
+        const status = document.querySelector('[data-status="' + row.id + '"]');
+        const at = document.querySelector('[data-at="' + row.id + '"]');
+        if (works) works.innerHTML = row.works;
+        if (status) status.innerHTML = row.status;
+        if (at) at.textContent = row.at;
+      }}
+      if (data.on) setTimeout(workTick, 2000);
+    }}
+    workTick();
+    </script>
+    """
+
+
+def work_list_row(row: dict, mode: str) -> str:
     rating = "" if row["rating"] is None else str(row["rating"])
     year = "" if row["year"] is None else str(row["year"])
     episodes = "" if row["episodes"] is None else str(row["episodes"])
     thumb = ""
     if row["image_url"]:
         thumb = f"<img src='{esc(row['image_url'])}' alt='' class='h-12 w-9 rounded object-cover'>"
+    title = esc(row["title"])
+    if row["deleted"] == 1:
+        title_html = f"<span class='font-medium'>{title}</span>"
+    else:
+        title_html = f"<a class='font-medium' href='/works/{row['id']}'>{title}</a>"
     return f"""
     <tr class="border-b border-stone-100 last:border-0 hover:bg-stone-50">
       <td class="px-4 py-2">{thumb}</td>
       <td class="px-4 py-3">
-        <a class="font-medium" href="/works/{row['id']}">{esc(row['title'])}</a>
+        {title_html}
         {pair_tags(row['tags'])}
       </td>
       <td class="px-4 py-3">{esc(KIND_LABEL.get(row['kind'], row['kind']))}</td>
@@ -486,6 +745,12 @@ def work_list_row(row: dict) -> str:
       <td class="px-4 py-3">{esc(episodes)}</td>
       <td class="px-4 py-3">{esc(rating)}</td>
       <td class="px-4 py-3">{int(row['cast_count'])}</td>
+      <td class="px-4 py-3 text-right">
+        <form method="post" action="/works/{row['id']}/exception">
+          <input type="hidden" name="deleted" value="{esc(mode)}">
+          <button class="rounded-md border border-stone-300 px-2 py-1 text-xs">예외</button>
+        </form>
+      </td>
     </tr>
     """
 
@@ -528,6 +793,7 @@ def credits_body() -> str:
                    count(DISTINCT pw.work_id) AS works
             FROM person p
             JOIN person_work pw ON pw.person_id = p.id
+            JOIN work w ON w.id = pw.work_id AND w.deleted = 0
             WHERE pw.role = ANY(%s)
             GROUP BY p.id
             ORDER BY p.name
@@ -589,6 +855,7 @@ def credit_body(person_id: int) -> str | None:
             WHERE p.id = %s
               AND EXISTS (
                 SELECT 1 FROM person_work pw
+                JOIN work w ON w.id = pw.work_id AND w.deleted = 0
                 WHERE pw.person_id = p.id AND pw.role = ANY(%s)
               )
             """,
@@ -601,7 +868,7 @@ def credit_body(person_id: int) -> str | None:
             SELECT w.id, w.title, w.kind, w.year, pw.role
             FROM person_work pw
             JOIN work w ON w.id = pw.work_id
-            WHERE pw.person_id = %s AND pw.role = ANY(%s)
+            WHERE pw.person_id = %s AND w.deleted = 0 AND pw.role = ANY(%s)
             ORDER BY w.year DESC NULLS LAST, w.title
             """,
             (person_id, list(CREDIT_ROLES)),
@@ -630,6 +897,8 @@ def credit_body(person_id: int) -> str | None:
             {meta('생일', person['born_text'])}
             {meta('다른 이름', aliases)}
           </dl>
+          {_credit_socials(person.get("socials"))}
+          {prose_block(person.get("about"))}
         </div>
       </div>
     </section>
@@ -650,6 +919,19 @@ def credit_body(person_id: int) -> str | None:
     """
 
 
+def _credit_socials(socials: object) -> str:
+    if not isinstance(socials, list):
+        return ""
+    items = "".join(
+        f"<li><a class='underline' href='{esc(item['url'])}' target='_blank' rel='noreferrer'>{esc(item.get('kind') or item['url'])}</a></li>"
+        for item in socials
+        if isinstance(item, dict) and isinstance(item.get("url"), str) and item["url"].startswith("http")
+    )
+    if not items:
+        return ""
+    return f"<ul class='mt-4 list-disc pl-5 text-sm'>{items}</ul>"
+
+
 def credit_work_row(row: dict) -> str:
     year = "" if row["year"] is None else str(row["year"])
     return f"""
@@ -663,6 +945,10 @@ def credit_work_row(row: dict) -> str:
 
 
 def work_body(work_id: int, error_text: str = "") -> str | None:
+    with connect() as conn:
+        found = conn.execute("SELECT deleted FROM work WHERE id = %s", (work_id,)).fetchone()
+    if found is None or found[0] == 1:
+        return None
     save_drama_detail(work_id)
     with connect() as conn:
         conn.row_factory = dict_row
@@ -679,15 +965,17 @@ def work_body(work_id: int, error_text: str = "") -> str | None:
             """,
             (work_id, list(CREDIT_ROLES)),
         ).fetchall()
-        episodes = conn.execute(
-            """
-            SELECT number, title, air_date, rating, votes, image_url, mdl_url, summary
-            FROM episode
-            WHERE work_id = %s
-            ORDER BY number
-            """,
-            (work_id,),
-        ).fetchall()
+        episodes = []
+        if work["kind"] != "movie":
+            episodes = conn.execute(
+                """
+                SELECT number, title, air_date, rating, votes, image_url, mdl_url, summary
+                FROM episode
+                WHERE work_id = %s
+                ORDER BY number
+                """,
+                (work_id,),
+            ).fetchall()
         credits = conn.execute(
             """
             SELECT p.id, p.name, p.native_name, p.image_url, pw.role
@@ -697,6 +985,27 @@ def work_body(work_id: int, error_text: str = "") -> str | None:
             ORDER BY p.name
             """,
             (work_id, list(CREDIT_ROLES)),
+        ).fetchall()
+        tmdb_rows = conn.execute(
+            """
+            SELECT country, name, offer, url
+            FROM work_provider
+            WHERE work_id = %s
+            ORDER BY country, name
+            """,
+            (work_id,),
+        ).fetchall()
+        networks = conn.execute(
+            """
+            SELECT c.id, c.name
+            FROM work_company wc
+            JOIN company c ON c.id = wc.company_id
+            JOIN company_type l ON l.company_id = c.id
+            JOIN org_type t ON t.id = l.org_type_id AND t.name = '방송사'
+            WHERE wc.work_id = %s
+            ORDER BY c.name
+            """,
+            (work_id,),
         ).fetchall()
     rating = "" if work["rating"] is None else str(work["rating"])
     year = "" if work["year"] is None else str(work["year"])
@@ -712,6 +1021,32 @@ def work_body(work_id: int, error_text: str = "") -> str | None:
     episode_rows = "\n".join(episode_row(row) for row in episodes) or """
       <tr><td class='px-4 py-6 text-stone-500' colspan='6'>가져온 에피소드가 없습니다.</td></tr>
     """
+    episode_section = ""
+    if work["kind"] != "movie":
+        episode_section = f"""
+    <section class="mt-6 overflow-hidden rounded-lg border border-stone-200 bg-white">
+      <div class="flex items-center justify-between border-b border-stone-200 px-4 py-3">
+        <h2 class="text-sm font-semibold">에피소드 {len(episodes)}</h2>
+        <form method="post" action="/works/{work_id}/episodes">
+          <button class="rounded-md bg-stone-900 px-3 py-2 text-sm font-medium text-white">에피소드 가져오기</button>
+        </form>
+      </div>
+      <p class="border-b border-stone-200 px-4 py-2 text-xs text-stone-500">kuryana /v2/dramas/{{slug}}/episodes</p>
+      <table class="w-full text-left text-sm">
+        <thead class="border-b border-stone-200 bg-stone-50 text-stone-500">
+          <tr>
+            <th class="px-4 py-3 font-medium"></th>
+            <th class="px-4 py-3 font-medium">화</th>
+            <th class="px-4 py-3 font-medium">제목</th>
+            <th class="px-4 py-3 font-medium">방영</th>
+            <th class="px-4 py-3 font-medium">평점</th>
+            <th class="px-4 py-3 font-medium">설명</th>
+          </tr>
+        </thead>
+        <tbody>{episode_rows}</tbody>
+      </table>
+    </section>
+        """
     poster = ""
     if work["image_url"]:
         poster = f"<img src='{esc(work['image_url'])}' alt='' class='h-44 w-32 rounded-md object-cover'>"
@@ -724,7 +1059,13 @@ def work_body(work_id: int, error_text: str = "") -> str | None:
       <div class="flex gap-5">
         {poster}
         <div class="min-w-0 flex-1">
-      <h1 class="text-2xl font-semibold">{esc(work['title'])}</h1>
+      <div class="flex items-start justify-between gap-3">
+        <h1 class="text-2xl font-semibold">{esc(work['title'])}</h1>
+        <form method="post" action="/works/{work_id}/exception">
+          <input type="hidden" name="deleted" value="0">
+          <button class="rounded-md border border-stone-300 px-3 py-2 text-sm">예외</button>
+        </form>
+      </div>
       <p class="mt-2 text-sm text-stone-500">원제</p>
       <p class="text-lg">{esc(work['native_title'] or '없음')}</p>
       <dl class="mt-4 grid grid-cols-2 gap-x-6 gap-y-2 text-sm">
@@ -733,14 +1074,17 @@ def work_body(work_id: int, error_text: str = "") -> str | None:
         {meta('회차', episode_count)}
         {meta('평점', rating)}
         {meta('MDL id', work['mdl_id'])}
+        {meta('방영', work['aired'])}
+        {meta('방영일', work['aired_on'])}
+        {meta('등급', work['content_rating'])}
+        {meta_link('홈페이지', work.get('homepage'))}
+        {network_links(networks)}
+        {tmdb_block(work, tmdb_rows)}
       </dl>
       {tags_block(work['tags'])}
       {work_source_line(work)}
       {synopsis_block(work['synopsis'])}
       {error}
-      <form method="post" action="/works/{work_id}/episodes" class="mt-4">
-        <button class="rounded-md bg-stone-900 px-3 py-2 text-sm font-medium text-white">에피소드 가져오기</button>
-      </form>
         </div>
       </div>
     </section>
@@ -763,23 +1107,7 @@ def work_body(work_id: int, error_text: str = "") -> str | None:
         <tbody>{credit_rows}</tbody>
       </table>
     </section>
-    <section class="mt-6 overflow-hidden rounded-lg border border-stone-200 bg-white">
-      <h2 class="border-b border-stone-200 px-4 py-3 text-sm font-semibold">에피소드 {len(episodes)}</h2>
-      <p class="border-b border-stone-200 px-4 py-2 text-xs text-stone-500">kuryana /v2/dramas/{{slug}}/episodes</p>
-      <table class="w-full text-left text-sm">
-        <thead class="border-b border-stone-200 bg-stone-50 text-stone-500">
-          <tr>
-            <th class="px-4 py-3 font-medium"></th>
-            <th class="px-4 py-3 font-medium">화</th>
-            <th class="px-4 py-3 font-medium">제목</th>
-            <th class="px-4 py-3 font-medium">방영</th>
-            <th class="px-4 py-3 font-medium">평점</th>
-            <th class="px-4 py-3 font-medium">설명</th>
-          </tr>
-        </thead>
-        <tbody>{episode_rows}</tbody>
-      </table>
-    </section>
+    {episode_section}
     <section class="mt-6 overflow-hidden rounded-lg border border-stone-200 bg-white">
       <h2 class="border-b border-stone-200 px-4 py-3 text-sm font-semibold">출연 {len(cast)}</h2>
       <table class="w-full text-left text-sm">
@@ -846,8 +1174,19 @@ def companies_body() -> str:
         conn.row_factory = dict_row
         rows = conn.execute(
             """
-            SELECT c.id, c.name, c.mdl_id, c.match_status,
-                   (SELECT count(*) FROM person_company pc WHERE pc.company_id = c.id) AS members
+            SELECT c.id, c.name, c.logo_url,
+                   (SELECT count(*) FROM person_company pc WHERE pc.company_id = c.id) AS members,
+                   COALESCE((
+                       SELECT string_agg(
+                           ct.name, ', '
+                           ORDER BY array_position(
+                               ARRAY['제작사','배급사','방송사','엔터테이먼트'], ct.name
+                           )
+                       )
+                       FROM company_type l
+                       JOIN org_type ct ON ct.id = l.org_type_id
+                       WHERE l.company_id = c.id
+                   ), '') AS types
             FROM company c
             ORDER BY c.name
             """
@@ -855,21 +1194,21 @@ def companies_body() -> str:
     if not rows:
         return """
         <section class="rounded-lg border border-stone-200 bg-white p-6">
-          <h1 class="text-xl font-semibold">소속사</h1>
-          <p class="mt-2 text-sm text-stone-600">등록된 소속사가 없습니다.</p>
+          <h1 class="text-xl font-semibold">종합 콘텐츠 스튜디오</h1>
+          <p class="mt-2 text-sm text-stone-600">등록된 종합 콘텐츠 스튜디오가 없습니다.</p>
         </section>
         """
     items = "\n".join(company_row(row) for row in rows)
     return f"""
     <section>
-      <h1 class="mb-4 text-xl font-semibold">소속사</h1>
+      <h1 class="mb-4 text-xl font-semibold">종합 콘텐츠 스튜디오</h1>
       <div class="overflow-hidden rounded-lg border border-stone-200 bg-white">
         <table class="w-full text-left text-sm">
           <thead class="border-b border-stone-200 bg-stone-50 text-stone-500">
             <tr>
+              <th class="px-4 py-3 font-medium">로고</th>
               <th class="px-4 py-3 font-medium">이름</th>
-              <th class="px-4 py-3 font-medium">MDL id</th>
-              <th class="px-4 py-3 font-medium">매칭</th>
+              <th class="px-4 py-3 font-medium">타입</th>
               <th class="px-4 py-3 font-medium">소속 배우</th>
             </tr>
           </thead>
@@ -883,20 +1222,58 @@ def companies_body() -> str:
 def company_row(row: dict) -> str:
     return f"""
     <tr class="border-b border-stone-100 last:border-0 hover:bg-stone-50">
+      <td class="px-4 py-3">{company_logo(row.get('logo_url'), tile=True)}</td>
       <td class="px-4 py-3"><a class="font-medium" href="/companies/{row['id']}">{esc(row['name'])}</a></td>
-      <td class="px-4 py-3">{esc(row['mdl_id'] or '')}</td>
-      <td class="px-4 py-3">{esc(row['match_status'])}</td>
+      <td class="px-4 py-3">{esc(row['types'])}</td>
       <td class="px-4 py-3">{int(row['members'])}</td>
     </tr>
     """
 
 
-def company_body(company_id: int) -> str | None:
+def save_company_urls(company_id: int, logo: str, homepage: str) -> None:
+    logo = logo.strip()
+    homepage = homepage.strip()
+    if logo and not logo.startswith(("http://", "https://")):
+        raise ValueError("로고 주소가 아닙니다")
+    if homepage and not homepage.startswith(("http://", "https://")):
+        raise ValueError("홈페이지 주소가 아닙니다")
+    with connect() as conn:
+        row = conn.execute("SELECT 1 FROM company WHERE id = %s", (company_id,)).fetchone()
+        if row is None:
+            raise ValueError("없는 종합 콘텐츠 스튜디오입니다")
+        conn.execute(
+            "UPDATE company SET logo_url = %s, homepage = %s WHERE id = %s",
+            (logo or None, homepage or None, company_id),
+        )
+        conn.commit()
+
+
+def company_body(company_id: int, error_text: str = "") -> str | None:
     with connect() as conn:
         conn.row_factory = dict_row
         company = conn.execute("SELECT * FROM company WHERE id = %s", (company_id,)).fetchone()
         if company is None:
             return None
+        types = conn.execute(
+            """
+            SELECT ct.name
+            FROM company_type l
+            JOIN org_type ct ON ct.id = l.org_type_id
+            WHERE l.company_id = %s
+            ORDER BY array_position(ARRAY['제작사','배급사','방송사','엔터테이먼트'], ct.name)
+            """,
+            (company_id,),
+        ).fetchall()
+        works = conn.execute(
+            """
+            SELECT w.id, w.title, w.year
+            FROM work_company wc
+            JOIN work w ON w.id = wc.work_id
+            WHERE wc.company_id = %s AND w.deleted = 0
+            ORDER BY w.year DESC NULLS LAST, w.title
+            """,
+            (company_id,),
+        ).fetchall()
         people = conn.execute(
             """
             SELECT p.id, p.name, p.native_name, pc.period_text, pc.is_current, pc.start_year
@@ -910,14 +1287,51 @@ def company_body(company_id: int) -> str | None:
     people_rows = "\n".join(member_row(row) for row in people) or """
       <tr><td class='px-4 py-6 text-stone-500' colspan='3'>소속 배우가 없습니다.</td></tr>
     """
+    work_rows = "\n".join(company_work_row(row) for row in works) or """
+      <tr><td class='px-4 py-6 text-stone-500' colspan='2'>연결된 작품이 없습니다.</td></tr>
+    """
+    error = ""
+    if error_text:
+        error = f"<p class='text-sm text-red-700'>{esc(error_text)}</p>"
+    logo_value = esc(company.get("logo_url") or "")
+    home_value = esc(company.get("homepage") or "")
     return f"""
-    <a href="/companies" class="text-sm text-stone-500 hover:text-stone-900">소속사</a>
+    <a href="/companies" class="text-sm text-stone-500 hover:text-stone-900">종합 콘텐츠 스튜디오</a>
     <section class="mt-3 rounded-lg border border-stone-200 bg-white p-6">
-      <h1 class="text-2xl font-semibold">{esc(company['name'])}</h1>
-      <dl class="mt-4 grid grid-cols-2 gap-x-6 gap-y-2 text-sm">
-        {meta('MDL id', company['mdl_id'])}
-        {meta('매칭', company['match_status'])}
-      </dl>
+      <div class="flex gap-4">
+        {company_logo(company.get('logo_url'))}
+        <div class="min-w-0 flex-1">
+          <h1 class="text-2xl font-semibold">{esc(company['name'])}</h1>
+          <dl class="mt-4 grid grid-cols-2 gap-x-6 gap-y-2 text-sm">
+            {meta('타입', ", ".join(row['name'] for row in types))}
+            {meta_link('홈페이지', company.get('homepage'))}
+          </dl>
+          <form method="post" action="/companies/{company_id}" class="mt-4 grid gap-3">
+            <label class="block text-sm">
+              <span class="text-stone-500">로고 이미지 URL</span>
+              <input name="logo_url" value="{logo_value}" class="mt-1 w-full rounded-md border border-stone-300 px-3 py-2">
+            </label>
+            <label class="block text-sm">
+              <span class="text-stone-500">홈페이지 URL</span>
+              <input name="homepage" value="{home_value}" class="mt-1 w-full rounded-md border border-stone-300 px-3 py-2">
+            </label>
+            <div><button class="rounded-md bg-stone-900 px-3 py-2 text-sm font-medium text-white">저장</button></div>
+            {error}
+          </form>
+        </div>
+      </div>
+    </section>
+    <section class="mt-6 overflow-hidden rounded-lg border border-stone-200 bg-white">
+      <h2 class="border-b border-stone-200 px-4 py-3 text-sm font-semibold">작품 {len(works)}</h2>
+      <table class="w-full text-left text-sm">
+        <thead class="border-b border-stone-200 bg-stone-50 text-stone-500">
+          <tr>
+            <th class="px-4 py-3 font-medium">제목</th>
+            <th class="px-4 py-3 font-medium">연도</th>
+          </tr>
+        </thead>
+        <tbody>{work_rows}</tbody>
+      </table>
     </section>
     <section class="mt-6 overflow-hidden rounded-lg border border-stone-200 bg-white">
       <h2 class="border-b border-stone-200 px-4 py-3 text-sm font-semibold">소속 배우 {len(people)}</h2>
@@ -933,6 +1347,22 @@ def company_body(company_id: int) -> str | None:
       </table>
     </section>
     """
+
+
+def company_logo(logo: object, tile: bool = False) -> str:
+    if not isinstance(logo, str) or not logo:
+        return ""
+    if tile:
+        return (
+            "<span class='inline-flex h-[50px] w-[50px] shrink-0 items-center justify-center overflow-hidden rounded border border-gray-200 bg-white'>"
+            f"<img src='{esc(logo)}' alt='' class='max-h-full max-w-full object-contain'>"
+            "</span>"
+        )
+    return (
+        "<span class='inline-flex h-[150px] w-[150px] shrink-0 items-center justify-center overflow-hidden rounded-[10px] border border-gray-200 bg-white'>"
+        f"<img src='{esc(logo)}' alt='' class='max-h-full max-w-full object-contain'>"
+        "</span>"
+    )
 
 
 def member_row(row: dict) -> str:
@@ -1191,7 +1621,7 @@ def wiki_saved(person: dict, sapphic: dict | None, fandom: dict | None, source: 
         hint = "GMMTV Wiki에 없는 항목만 고른다." if is_gmmtv(sapphic) else "선택한 위키 정보가 없습니다."
         return f"""
         <section class="mt-6 rounded-lg border border-stone-200 bg-white p-6">
-          <h2 class="text-sm font-semibold">영어 위키</h2>
+          <h2 class="text-sm font-semibold">위키</h2>
           <p class="mt-2 text-sm text-stone-600">{hint}</p>
           <p class="mt-3">{link}</p>
         </section>
@@ -1208,7 +1638,7 @@ def wiki_saved(person: dict, sapphic: dict | None, fandom: dict | None, source: 
     <section class="mt-6 rounded-lg border border-stone-200 bg-white p-6">
       <div class="flex items-start justify-between gap-4">
         <div>
-          <h2 class="text-sm font-semibold">영어 위키</h2>
+          <h2 class="text-sm font-semibold">위키</h2>
           <p class="mt-1 text-sm text-stone-600">
             출처 <a class="font-medium text-stone-900 underline" href="{esc(payload.get('url') or '')}" target="_blank" rel="noreferrer">{esc(source['display_name'] or source['external_key'])}</a>
             · CC-BY-SA · {esc(stamp(source['selected_at']))}
@@ -1264,11 +1694,11 @@ def wiki_search_body(person_id: int, query: str, error_text: str = "") -> str | 
         if not profiles and not error:
             error = "<p class='mt-4 text-sm text-stone-600'>맞는 위키 문서가 없습니다.</p>"
         cards = "\n".join(wiki_card(person_id, profile, allowed) for profile in profiles)
-    hint = "GMMTV Wiki에 없는 항목만 보인다." if gmmtv else "고른 항목만 이 배우의 영어 위키 출처로 저장한다."
+    hint = "GMMTV Wiki에 없는 항목만 보인다." if gmmtv else "고른 항목만 이 배우의 위키 출처로 저장한다. 영어에 없으면 프랑스 위키를 본다."
     return f"""
     <a href="/people/{person_id}" class="text-sm text-stone-500 hover:text-stone-900">배우</a>
     <section class="mt-3 rounded-lg border border-stone-200 bg-white p-6">
-      <h1 class="text-xl font-semibold">영어 위키 검색</h1>
+      <h1 class="text-xl font-semibold">위키 검색</h1>
       <p class="mt-2 text-sm text-stone-600">{hint}</p>
       <form method="get" action="/people/{person_id}/wiki" class="mt-4 flex gap-2">
         <input name="q" value="{esc(active_query)}" class="w-full rounded-md border border-stone-300 px-3 py-2 text-sm">
@@ -1305,6 +1735,7 @@ def wiki_card(person_id: int, profile: dict, allowed: set[str]) -> str:
     return f"""
     <form method="post" action="/people/{person_id}/wiki" class="rounded-lg border border-stone-200 bg-white p-5">
       <input type="hidden" name="title" value="{esc(profile['title'])}">
+      <input type="hidden" name="lang" value="{esc(profile.get('language') or 'en')}">
       <h2 class="text-lg font-semibold">{esc(profile['name'])}</h2>
       <a class="text-sm text-stone-500 underline" href="{esc(profile['url'])}" target="_blank" rel="noreferrer">{esc(profile['title'])}</a>
       {f"<img src='{esc(profile['image_url'])}' alt='' class='mt-3 h-24 w-20 rounded-md object-cover'>" if profile.get("image_url") else ""}
@@ -1315,15 +1746,15 @@ def wiki_card(person_id: int, profile: dict, allowed: set[str]) -> str:
     """
 
 
-def save_wiki(person_id: int, title: str, fields: list[str]) -> None:
-    try:
-        profile = fetch_wiki(title)
-    except urllib.error.HTTPError as exc:
-        if exc.code == 429:
-            raise ValueError("영어 위키가 요청을 잠시 막았습니다. 조금 뒤 다시 고르세요") from exc
-        raise ValueError("위키 문서를 읽지 못했습니다") from exc
-    except urllib.error.URLError as exc:
-        raise ValueError("위키 문서를 읽지 못했습니다") from exc
+def _wiki_key(profile: dict) -> str:
+    language = profile.get("language") or "en"
+    if language == "en":
+        return profile["title"]
+    return f"{language}:{profile['title']}"
+
+
+def save_wiki(person_id: int, title: str, fields: list[str], language: str = "en") -> None:
+    profile = fetch_wiki(title, language)
     if profile is None:
         raise ValueError("인물 문서가 아닙니다")
     with connect() as conn:
@@ -1340,7 +1771,7 @@ def save_wiki(person_id: int, title: str, fields: list[str]) -> None:
             SELECT person_id FROM person_source
             WHERE source = %s AND external_key = %s AND person_id <> %s
             """,
-            (WIKI_SOURCE, profile["title"], person_id),
+            (WIKI_SOURCE, _wiki_key(profile), person_id),
         ).fetchone()
         if taken:
             raise ValueError("이미 다른 배우에 연결된 위키 문서입니다")
@@ -1354,7 +1785,7 @@ def save_wiki(person_id: int, title: str, fields: list[str]) -> None:
                 payload = EXCLUDED.payload,
                 selected_at = now()
             """,
-            (person_id, WIKI_SOURCE, profile["title"], profile["name"], Json(payload)),
+            (person_id, WIKI_SOURCE, _wiki_key(profile), profile["name"], Json(payload)),
         )
         if "agent" in fields and profile.get("agent"):
             save_wiki_spells(conn, person_id, profile["agent"])
@@ -1654,11 +2085,90 @@ def source_line(person: dict) -> str:
     """
 
 
+def provider_link(row: dict) -> str:
+    name = esc(row["name"])
+    url = row.get("url")
+    if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+        return name
+    return f"<a class='underline' href='{esc(url)}' target='_blank' rel='noreferrer'>{name}</a>"
+
+
+def tmdb_block(work: dict, rows: list[dict]) -> str:
+    kind = work.get("tmdb_kind") or ("movie" if work["kind"] == "movie" else "tv")
+    tmdb_id = "" if work.get("tmdb_id") is None else str(work["tmdb_id"])
+    tv = "selected" if kind == "tv" else ""
+    movie = "selected" if kind == "movie" else ""
+    groups = []
+    for code, label in (("KR", "한국"), ("TH", "태국")):
+        items = [row for row in rows if row["country"] == code]
+        if not items:
+            continue
+        chips = "".join(
+            "<div class='flex items-center gap-2'>"
+            f"{provider_link(row)} "
+            f"<span class='rounded-full bg-stone-100 px-2 py-0.5 text-xs'>{esc(row['offer'])}</span>"
+            "</div>"
+            for row in items
+        )
+        groups.append(
+            f"<div class='mt-2'><div class='text-xs text-stone-500'>{label}</div>"
+            f"<div class='mt-1 space-y-1'>{chips}</div></div>"
+        )
+    body = "".join(groups)
+    if work.get("tmdb_id") is not None and not groups:
+        body = "<p class='mt-2 text-sm text-stone-500'>한국·태국 제공처가 없습니다.</p>"
+    return f"""
+    <div class="col-span-2">
+      <div class="text-stone-500">TMDB</div>
+      <form method="post" action="/works/{work['id']}/tmdb" class="mt-1 flex gap-2">
+        <select name="tmdb_kind" class="rounded-md border border-stone-300 px-2 py-2 text-sm">
+          <option value="tv" {tv}>tv</option>
+          <option value="movie" {movie}>movie</option>
+        </select>
+        <input name="tmdb_id" value="{esc(tmdb_id)}" placeholder="TMDB id" class="w-40 rounded-md border border-stone-300 px-3 py-2 text-sm">
+        <button class="rounded-md bg-stone-900 px-3 py-2 text-sm font-medium text-white">다시 가져오기</button>
+      </form>
+      {body}
+    </div>
+    """
+
+
+def network_links(rows: list[dict]) -> str:
+    if not rows:
+        return ""
+    links = ", ".join(
+        f"<a class='underline' href='/companies/{row['id']}'>{esc(row['name'])}</a>"
+        for row in rows
+    )
+    return f"<div><dt class='text-stone-500'>방송사</dt><dd>{links}</dd></div>"
+
+
+def company_work_row(row: dict) -> str:
+    year = "" if row["year"] is None else str(row["year"])
+    return f"""
+    <tr class="border-b border-stone-100 last:border-0">
+      <td class="px-4 py-3"><a class="font-medium" href="/works/{row['id']}">{esc(row['title'])}</a></td>
+      <td class="px-4 py-3">{esc(year)}</td>
+    </tr>
+    """
+
+
 def meta(label: str, value: object) -> str:
     text = "" if value is None else str(value)
     if not text:
         return ""
     return f"<div><dt class='text-stone-500'>{esc(label)}</dt><dd>{esc(text)}</dd></div>"
+
+
+def meta_link(label: str, value: object) -> str:
+    text = "" if value is None else str(value).strip()
+    if not text.startswith(("http://", "https://")):
+        return meta(label, text)
+    safe = esc(text)
+    return (
+        f"<div><dt class='text-stone-500'>{esc(label)}</dt>"
+        f"<dd><a class='break-all underline' href='{safe}' target='_blank' rel='noreferrer'>{safe}</a></dd></div>"
+    )
 
 
 def status_badge(status: str) -> str:
