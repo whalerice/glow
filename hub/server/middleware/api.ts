@@ -1,4 +1,4 @@
-export default defineEventHandler((event) => {
+export default defineEventHandler(event => {
   const url = getRequestURL(event)
   if (!url.pathname.startsWith('/api/')) return
   const base = useRuntimeConfig(event).storageUrl.replace(/\/$/, '')

@@ -319,11 +319,11 @@ def person_payload(person_id: int) -> dict:
         works = conn.execute(
             """
             SELECT w.id, w.title, w.kind, w.year, w.episodes, w.rating, w.mdl_id,
-                   pw.role, pw.character_name
+                   w.image_url, w.tags, pw.role, pw.character_name
             FROM person_work pw
             JOIN work w ON w.id = pw.work_id
             WHERE pw.person_id = %s AND w.deleted = 0 AND NOT (pw.role = ANY(%s))
-            ORDER BY w.year DESC NULLS LAST, w.title
+            ORDER BY w.year DESC NULLS FIRST, w.title
             """,
             (person_id, list(CREDIT_ROLES)),
         ).fetchall()
@@ -370,10 +370,37 @@ def works_payload(mode: str) -> dict:
                     WHERE pw.work_id = w.id AND NOT (pw.role = ANY(%s))) AS cast_count
             FROM work w
             {where}
-            ORDER BY w.year DESC NULLS LAST, w.title
+            ORDER BY w.year DESC NULLS FIRST, w.title
             """,
             (list(CREDIT_ROLES),),
         ).fetchall()
+        faces: dict[int, list[dict]] = {}
+        ids = [row["id"] for row in rows]
+        if ids:
+            seen: set[tuple[int, int]] = set()
+            for item in conn.execute(
+                """
+                SELECT pw.work_id, p.id, p.name, p.image_url
+                FROM person_work pw
+                JOIN person p ON p.id = pw.person_id
+                WHERE pw.work_id = ANY(%s) AND NOT (pw.role = ANY(%s))
+                ORDER BY p.name
+                """,
+                (ids, list(CREDIT_ROLES)),
+            ).fetchall():
+                key = (item["work_id"], item["id"])
+                if key in seen:
+                    continue
+                seen.add(key)
+                faces.setdefault(item["work_id"], []).append(
+                    {
+                        "id": item["id"],
+                        "name": item["name"],
+                        "image_url": item["image_url"],
+                    }
+                )
+        for row in rows:
+            row["cast"] = faces.get(row["id"], [])
     return {"deleted": mode, "works": _counts(rows, "cast_count")}
 
 

@@ -22,8 +22,8 @@ export type SourceRow = {
 const CREDIT_ORDER = ['Screenwriter & Director', 'Director', 'Screenwriter']
 const CREDIT_LABEL: Record<string, string> = {
   'Screenwriter & Director': '작가·감독',
-  'Director': '감독',
-  'Screenwriter': '작가'
+  Director: '감독',
+  Screenwriter: '작가'
 }
 
 export function routeId(value: string | string[] | undefined) {
@@ -52,10 +52,14 @@ export function worksCount(works: number, hidden: number) {
 
 export function creditLabels(roles: string[] | null) {
   const values = new Set(roles || [])
-  const writer = values.has('Screenwriter') || values.has('Screenwriter & Director')
-  const director = values.has('Director') || values.has('Screenwriter & Director')
+  const writer =
+    values.has('Screenwriter') || values.has('Screenwriter & Director')
+  const director =
+    values.has('Director') || values.has('Screenwriter & Director')
   if (writer && director) return '작가·감독'
-  return CREDIT_ORDER.filter(role => values.has(role)).map(role => CREDIT_LABEL[role] || role).join(', ')
+  return CREDIT_ORDER.filter(role => values.has(role))
+    .map(role => CREDIT_LABEL[role] || role)
+    .join(', ')
 }
 
 export function creditLabel(role: string) {
@@ -66,7 +70,11 @@ export function pairTags(tags: string[] | null) {
   const values = new Set(tags || [])
   const labels: string[] = []
   if (values.has('Lesbian Romance')) labels.push('GL')
-  if ((values.has('Gay Romance') || values.has('Gay Male Lead')) && !labels.includes('BL')) labels.push('BL')
+  if (
+    (values.has('Gay Romance') || values.has('Gay Male Lead')) &&
+    !labels.includes('BL')
+  )
+    labels.push('BL')
   return labels
 }
 
@@ -78,7 +86,10 @@ export function statusColor(status: string) {
 }
 
 export function httpUrl(value: unknown) {
-  return typeof value === 'string' && (value.startsWith('http://') || value.startsWith('https://'))
+  return (
+    typeof value === 'string' &&
+    (value.startsWith('http://') || value.startsWith('https://'))
+  )
 }
 
 export function errorText(error: unknown) {
@@ -91,13 +102,20 @@ export function errorText(error: unknown) {
 export function isGmmtv(source: SourceRow) {
   const company = source?.payload?.company
   if (!company || typeof company !== 'object') return false
-  const row = company as { name?: string, slug?: string }
-  const name = String(row.name || '').trim().toLowerCase()
-  const slug = String(row.slug || '').trim().toLowerCase()
+  const row = company as { name?: string; slug?: string }
+  const name = String(row.name || '')
+    .trim()
+    .toLowerCase()
+  const slug = String(row.slug || '')
+    .trim()
+    .toLowerCase()
   return name === 'gmmtv' || slug === 'gmmtv'
 }
 
 export function storageFetch<T>(path: () => string) {
   const config = useRuntimeConfig()
-  return useFetch<T>(path, import.meta.server ? { baseURL: config.storageUrl } : {})
+  return useFetch<T>(
+    path,
+    import.meta.server ? { baseURL: config.storageUrl } : {}
+  )
 }

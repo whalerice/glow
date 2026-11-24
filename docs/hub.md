@@ -30,10 +30,9 @@ storage에서 `/api`가 아닌 경로는 404 `{"error":"없는 화면입니다."
 
 | 파일 | URL |
 | --- | --- |
-| `hub/app/app.vue` | 공통 헤더 |
+| `hub/app/app.vue` | 왼쪽 사이드바 |
 | `hub/app/pages/index.vue` | `/` → `/people` |
 | `hub/app/pages/people/index.vue` | `/people` |
-| `hub/app/pages/register.vue` | `/register` |
 | `hub/app/pages/people/[id].vue` | `/people/:id` |
 | `hub/app/pages/people/[id]/sapphic.vue` | `/people/:id/sapphic` |
 | `hub/app/pages/people/[id]/fandom.vue` | `/people/:id/fandom` |
@@ -45,7 +44,7 @@ storage에서 `/api`가 아닌 경로는 404 `{"error":"없는 화면입니다."
 | `hub/app/pages/companies/index.vue` | `/companies` |
 | `hub/app/pages/companies/[id].vue` | `/companies/:id` |
 
-헤더 링크는 배우 등록, 배우, 작품, 작가·감독, 종합 콘텐츠 스튜디오다.
+사이드바 대메뉴는 수집이다. 하위는 배우, 작품, 작가·감독, 종합 콘텐츠 스튜디오다. 배우 등록은 배우 목록의 버튼이 모달을 연다.
 
 ## API
 

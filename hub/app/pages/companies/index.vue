@@ -9,7 +9,9 @@ type CompanyRow = {
   types: string
 }
 
-const { data, error } = await storageFetch<{ companies: CompanyRow[] }>(() => '/api/companies')
+const { data, error } = await storageFetch<{ companies: CompanyRow[] }>(
+  () => '/api/companies'
+)
 const companies = computed(() => data.value?.companies || [])
 const columns: TableColumn<CompanyRow>[] = [
   { accessorKey: 'logo_url', header: '로고' },
@@ -28,20 +30,11 @@ const columns: TableColumn<CompanyRow>[] = [
       :title="errorText(error)"
       class="mb-4"
     />
-    <h1 class="mb-4 text-xl font-semibold">
-      종합 콘텐츠 스튜디오
-    </h1>
-    <p
-      v-if="!companies.length"
-      class="text-sm text-muted"
-    >
+    <h1 class="mb-4 text-xl font-semibold">종합 콘텐츠 스튜디오</h1>
+    <p v-if="!companies.length" class="text-sm text-muted">
       등록된 종합 콘텐츠 스튜디오가 없습니다.
     </p>
-    <UTable
-      v-else
-      :data="companies"
-      :columns="columns"
-    >
+    <UTable v-else :data="companies" :columns="columns">
       <template #logo_url-cell="{ row }">
         <span
           v-if="row.original.logo_url"
@@ -51,14 +44,11 @@ const columns: TableColumn<CompanyRow>[] = [
             :src="row.original.logo_url"
             alt=""
             class="max-h-full max-w-full object-contain"
-          >
+          />
         </span>
       </template>
       <template #name-cell="{ row }">
-        <NuxtLink
-          :to="`/companies/${row.original.id}`"
-          class="font-medium"
-        >
+        <NuxtLink :to="`/companies/${row.original.id}`" class="font-medium">
           {{ row.original.name }}
         </NuxtLink>
       </template>

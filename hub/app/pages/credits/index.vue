@@ -11,7 +11,9 @@ type CreditRow = {
   works: number
 }
 
-const { data, error } = await storageFetch<{ credits: CreditRow[] }>(() => '/api/credits')
+const { data, error } = await storageFetch<{ credits: CreditRow[] }>(
+  () => '/api/credits'
+)
 const credits = computed(() => data.value?.credits || [])
 const columns: TableColumn<CreditRow>[] = [
   { accessorKey: 'image_url', header: '' },
@@ -31,39 +33,28 @@ const columns: TableColumn<CreditRow>[] = [
       :title="errorText(error)"
       class="mb-4"
     />
-    <h1 class="mb-4 text-xl font-semibold">
-      작가·감독
-    </h1>
-    <p
-      v-if="!credits.length"
-      class="text-sm text-muted"
-    >
+    <h1 class="mb-4 text-xl font-semibold">작가·감독</h1>
+    <p v-if="!credits.length" class="text-sm text-muted">
       수집된 작가·감독이 없습니다.
     </p>
-    <UTable
-      v-else
-      :data="credits"
-      :columns="columns"
-    >
+    <UTable v-else :data="credits" :columns="columns">
       <template #image_url-cell="{ row }">
         <img
           v-if="row.original.image_url"
           :src="row.original.image_url"
           alt=""
           class="h-12 w-9 rounded object-cover"
-        >
+        />
       </template>
       <template #name-cell="{ row }">
-        <NuxtLink
-          :to="`/credits/${row.original.id}`"
-          class="font-medium"
-        >
+        <NuxtLink :to="`/credits/${row.original.id}`" class="font-medium">
           {{ row.original.name || '이름 없음' }}
         </NuxtLink>
         <span
           v-if="row.original.native_name"
           class="block text-xs text-muted"
-        >{{ row.original.native_name }}</span>
+          >{{ row.original.native_name }}</span
+        >
       </template>
       <template #roles-cell="{ row }">
         {{ creditLabels(row.original.roles) }}
