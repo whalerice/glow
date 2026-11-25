@@ -57,8 +57,63 @@ ALTER TABLE work ADD COLUMN IF NOT EXISTS air_at timestamptz;
 ALTER TABLE work DROP COLUMN IF EXISTS watch_at;
 ALTER TABLE work ADD COLUMN IF NOT EXISTS tmdb_id bigint;
 ALTER TABLE work ADD COLUMN IF NOT EXISTS tmdb_kind text;
+ALTER TABLE work ADD COLUMN IF NOT EXISTS keywords text[];
+ALTER TABLE work ADD COLUMN IF NOT EXISTS ko_title text;
 ALTER TABLE work ADD COLUMN IF NOT EXISTS homepage text;
 ALTER TABLE work ADD COLUMN IF NOT EXISTS deleted smallint NOT NULL DEFAULT 0;
+CREATE TABLE IF NOT EXISTS queer (
+    id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name text NOT NULL UNIQUE
+);
+INSERT INTO queer (name)
+VALUES ('BL'), ('GL'), ('LGBTQ')
+ON CONFLICT (name) DO NOTHING;
+ALTER TABLE work DROP CONSTRAINT IF EXISTS work_pair_chk;
+ALTER TABLE work DROP COLUMN IF EXISTS pair;
+ALTER TABLE work ADD COLUMN IF NOT EXISTS queer bigint REFERENCES queer (id);
+UPDATE work
+SET queer = (
+  SELECT id FROM queer
+  WHERE name = CASE
+    WHEN EXISTS (SELECT 1 FROM unnest(tags) AS tag WHERE tag ILIKE '%lesbian%')
+     AND ('Gay Romance' = ANY (tags) OR 'Gay Male Lead' = ANY (tags)) THEN 'LGBTQ'
+    WHEN EXISTS (SELECT 1 FROM unnest(tags) AS tag WHERE tag ILIKE '%lesbian%') THEN 'GL'
+    WHEN 'Gay Romance' = ANY (tags) OR 'Gay Male Lead' = ANY (tags) THEN 'BL'
+  END
+)
+WHERE queer IS NULL
+  AND (
+    EXISTS (SELECT 1 FROM unnest(tags) AS tag WHERE tag ILIKE '%lesbian%')
+    OR 'Gay Romance' = ANY (tags)
+    OR 'Gay Male Lead' = ANY (tags)
+  );
+UPDATE work
+SET queer = (
+  SELECT id FROM queer
+  WHERE name = CASE
+    WHEN 'Gay Romance' = ANY (tags) OR 'Gay Male Lead' = ANY (tags) THEN 'LGBTQ'
+    ELSE 'GL'
+  END
+)
+WHERE EXISTS (
+  SELECT 1 FROM unnest(tags) AS tag WHERE tag ILIKE '%lesbian%'
+);
+UPDATE work
+SET queer = (
+  SELECT id FROM queer
+  WHERE name = CASE
+    WHEN 'Gay Romance' = ANY (tags) OR 'Gay Male Lead' = ANY (tags) THEN 'LGBTQ'
+    ELSE 'GL'
+  END
+)
+WHERE EXISTS (
+  SELECT 1
+  FROM unnest(keywords) AS keyword
+  WHERE replace(replace(lower(keyword), '’', ''''), '‘', '''')
+        IN ('girls'' love (gl)', 'girls'' love', 'gl')
+);
+ALTER TABLE work DROP COLUMN IF EXISTS pair_id;
+DROP TABLE IF EXISTS pair;
 
 CREATE UNIQUE INDEX IF NOT EXISTS work_title_year_kind_no_mdl
     ON work (title, year, kind) NULLS NOT DISTINCT
@@ -198,6 +253,17 @@ INSERT INTO role (code, name) VALUES
     ('d', '감독'),
     ('w', '작가')
 ON CONFLICT (code) DO NOTHING;
+
+UPDATE work AS w
+SET episodes = counted.n
+FROM (
+    SELECT work_id, count(*)::integer AS n
+    FROM episode
+    GROUP BY work_id
+) AS counted
+WHERE w.id = counted.work_id
+  AND (w.episodes IS NULL OR w.episodes = 0)
+  AND counted.n > 0;
 
 CREATE TABLE IF NOT EXISTS person_role (
     person_id bigint NOT NULL REFERENCES person (id),

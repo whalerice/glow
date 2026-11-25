@@ -28,6 +28,8 @@ type Work = {
   rating: number | null
   image_url: string | null
   tags: string[] | null
+  queer: number | null
+  queer_name: string | null
 }
 
 type Affiliation = {
@@ -124,6 +126,18 @@ const columns: TableColumn<Work>[] = [
 function payloadText(source: SourceRow, key: string) {
   const value = source?.payload?.[key]
   return typeof value === 'string' ? value : ''
+}
+
+function agents(source: SourceRow) {
+  const value = source?.payload?.agent
+  if (!Array.isArray(value)) return []
+  return value.filter(
+    (item): item is { name: string; period_text?: string | null } =>
+      !!item &&
+      typeof item === 'object' &&
+      typeof (item as { name?: string }).name === 'string' &&
+      !!(item as { name: string }).name.trim()
+  )
 }
 
 function socials(source: SourceRow) {
@@ -502,6 +516,17 @@ async function remove() {
               <dt class="text-muted">활동 기간</dt>
               <dd>{{ payloadText(wiki, 'years_active') }}</dd>
             </div>
+            <div v-if="agents(wiki).length" class="col-span-2">
+              <dt class="text-muted">소속사</dt>
+              <dd>
+                <span v-for="(item, index) in agents(wiki)" :key="`${item.name}-${index}`">
+                  {{ item.name
+                  }}<template v-if="item.period_text">
+                    {{ ' ' + item.period_text }}</template
+                  ><template v-if="index < agents(wiki).length - 1">, </template>
+                </span>
+              </dd>
+            </div>
           </dl>
           <template
             v-for="block in [
@@ -555,12 +580,13 @@ async function remove() {
             {{ row.original.title }}
           </NuxtLink>
           <UBadge
-            v-for="label in pairTags(row.original.tags)"
-            :key="label"
-            :color="label === 'BL' ? 'secondary' : 'primary'"
-            class="ms-2"
+            v-if="row.original.queer_name"
+            :color="row.original.queer_name === 'BL' ? 'secondary' : 'primary'"
+            :class="
+              row.original.queer_name === 'GL' ? 'gl-badge ms-2' : 'ms-2'
+            "
           >
-            {{ label }}
+            {{ row.original.queer_name }}
           </UBadge>
         </template>
         <template #kind-cell="{ row }">

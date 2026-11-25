@@ -33,7 +33,6 @@ const columns: TableColumn<CreditRow>[] = [
       :title="errorText(error)"
       class="mb-4"
     />
-    <h1 class="mb-4 text-xl font-semibold">작가·감독</h1>
     <p v-if="!credits.length" class="text-sm text-muted">
       수집된 작가·감독이 없습니다.
     </p>

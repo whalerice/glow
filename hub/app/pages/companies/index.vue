@@ -30,7 +30,6 @@ const columns: TableColumn<CompanyRow>[] = [
       :title="errorText(error)"
       class="mb-4"
     />
-    <h1 class="mb-4 text-xl font-semibold">종합 콘텐츠 스튜디오</h1>
     <p v-if="!companies.length" class="text-sm text-muted">
       등록된 종합 콘텐츠 스튜디오가 없습니다.
     </p>

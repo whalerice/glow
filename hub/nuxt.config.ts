@@ -38,6 +38,21 @@ export default defineNuxtConfig({
   },
 
   fonts: {
-    families: [{ name: 'BusanDandiGothic', provider: 'none' }]
+    families: [
+      { name: 'Roboto', weights: [400, 500, 700] },
+      { name: 'BusanDandiGothic', provider: 'none' }
+    ]
+  },
+
+  icon: {
+    clientBundle: {
+      icons: [
+        'lucide:users',
+        'lucide:clapperboard',
+        'lucide:pen-line',
+        'lucide:building-2',
+        'lucide:sparkles'
+      ]
+    }
   }
 })

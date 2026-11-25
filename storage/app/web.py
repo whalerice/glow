@@ -6,6 +6,7 @@ from urllib.parse import parse_qs, urlparse
 from app.agency import backfill_sapphic
 from app.api import ApiError, dispatch, dumps, move_ships
 from app.collect import apply_schema, connect, fill_drama_details, move_credits
+from app.tmdb import fill_keywords, fill_ko_titles
 
 
 def serve(host: str, port: int) -> None:
@@ -16,6 +17,8 @@ def serve(host: str, port: int) -> None:
         move_ships(conn)
         conn.commit()
     Thread(target=fill_drama_details, daemon=True).start()
+    Thread(target=fill_keywords, daemon=True).start()
+    Thread(target=fill_ko_titles, daemon=True).start()
     server = ThreadingHTTPServer((host, port), Handler)
     print(f"http://{host}:{port}", flush=True)
     server.serve_forever()

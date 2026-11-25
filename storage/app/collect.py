@@ -482,6 +482,13 @@ def poster_map(body: dict) -> dict[str, DramaDetail | None]:
 
 
 def fetch_drama_text(slug: str) -> DramaDetail | None:
+    data = load_drama(slug)
+    if data is None:
+        return None
+    return drama_detail(data)
+
+
+def load_drama(slug: str) -> dict | None:
     base = os.environ.get("KURYANA_BASE_URL", "https://kuryana.tbdh.app").rstrip("/")
     request = urllib.request.Request(
         f"{base}/v2/dramas/{urllib.parse.quote(slug)}",
@@ -495,8 +502,20 @@ def fetch_drama_text(slug: str) -> DramaDetail | None:
     if not isinstance(payload, dict) or payload.get("success") is not True:
         return None
     data = payload.get("data")
-    if not isinstance(data, dict):
+    return data if isinstance(data, dict) else None
+
+
+def queer_id(conn: psycopg.Connection, tags: list[str]) -> int | None:
+    gl = any("lesbian" in tag.casefold() for tag in tags)
+    bl = "Gay Romance" in tags or "Gay Male Lead" in tags
+    name = "LGBTQ" if gl and bl else "GL" if gl else "BL" if bl else None
+    if name is None:
         return None
+    row = conn.execute("SELECT id FROM queer WHERE name = %s", (name,)).fetchone()
+    return int(row[0]) if row else None
+
+
+def drama_detail(data: dict) -> DramaDetail:
     raw_tags = data.get("tags")
     if not isinstance(raw_tags, list):
         raw_tags = []
@@ -510,6 +529,84 @@ def fetch_drama_text(slug: str) -> DramaDetail | None:
         detail_text(data.get("aired_on")),
         content_code(data.get("content_rating")),
     )
+
+
+def mdl_slug(mdl_id: str) -> str | None:
+    try:
+        response = cffi_requests.get(
+            "https://mydramalist.com/search",
+            params={"q": mdl_id},
+            impersonate="chrome110",
+            timeout=20,
+        )
+    except Exception:
+        return None
+    if response.status_code != 200:
+        return None
+    prefix = f"/{mdl_id}-"
+    for anchor in BeautifulSoup(response.text, "html.parser").select("a[href]"):
+        href = (anchor.get("href") or "").split("?", 1)[0]
+        if href.startswith(prefix):
+            return href.strip("/")
+    return None
+
+
+def register_work(raw_id: str) -> tuple[int, str, bool]:
+    mdl_id = person_mdl_id(raw_id)
+    if mdl_id is None:
+        raise ValueError("숫자 id가 아닙니다")
+    with connect() as conn:
+        apply_schema(conn)
+        found = conn.execute("SELECT id FROM work WHERE mdl_id = %s", (mdl_id,)).fetchone()
+        if found:
+            conn.commit()
+            return int(found[0]), mdl_id, True
+        conn.commit()
+    slug = mdl_id
+    data = load_drama(slug)
+    if data is None:
+        slug = mdl_slug(mdl_id) or ""
+        data = load_drama(slug) if slug else None
+    if data is None:
+        raise ValueError("작품을 찾지 못했습니다")
+    kind = work_kind(data.get("type"))
+    item = {
+        "title": data.get("title"),
+        "year": data.get("year"),
+        "episodes": data.get("episodes"),
+        "rating": data.get("rating"),
+        "link": f"https://mydramalist.com/{slug}",
+        "slug": slug,
+    }
+    with connect() as conn:
+        work_id = upsert_work(conn, item, kind, drama_detail(data))
+        if work_id is None:
+            raise ValueError("제목이 없습니다")
+        conn.commit()
+    if kind != "movie":
+        try:
+            collect_episodes(work_id)
+        except Exception:
+            pass
+    for item in main_cast(slug):
+        if is_male(item["mdl_id"]):
+            continue
+        try:
+            result = register(item["mdl_id"])
+        except Exception:
+            continue
+        link_main_role(work_id, result.person_id, item["character"])
+    return work_id, mdl_id, False
+
+
+def work_kind(value: object) -> str:
+    if value == "Movie":
+        return "movie"
+    if value == "Drama":
+        return "drama"
+    if isinstance(value, str) and value.strip():
+        return "tv_show"
+    raise ValueError("종류가 없습니다")
 
 
 def detail_text(value: object) -> str | None:
@@ -714,11 +811,19 @@ def save_drama_detail(work_id: int) -> None:
             SET synopsis = COALESCE(%s, synopsis),
                 native_title = COALESCE(%s, native_title),
                 tags = %s::text[],
+                queer = %s,
                 image_url = COALESCE(%s, image_url),
                 detail_at = now()
             WHERE id = %s AND detail_at IS NULL
             """,
-            (detail.synopsis, detail.native_title, detail.tags, detail.image_url, work_id),
+            (
+                detail.synopsis,
+                detail.native_title,
+                detail.tags,
+                queer_id(conn, detail.tags),
+                detail.image_url,
+                work_id,
+            ),
         )
         save_broadcasters(conn, work_id, detail.networks)
         save_air(conn, work_id, detail)
@@ -753,11 +858,19 @@ def fill_drama_details() -> None:
                 SET synopsis = COALESCE(%s, synopsis),
                     native_title = COALESCE(%s, native_title),
                     tags = %s::text[],
+                    queer = %s,
                     image_url = COALESCE(%s, image_url),
                     detail_at = now()
                 WHERE id = %s AND detail_at IS NULL
                 """,
-                (detail.synopsis, detail.native_title, detail.tags, detail.image_url, work_id),
+                (
+                    detail.synopsis,
+                    detail.native_title,
+                    detail.tags,
+                    queer_id(conn, detail.tags),
+                    detail.image_url,
+                    work_id,
+                ),
             )
             save_broadcasters(conn, work_id, detail.networks)
             save_air(conn, work_id, detail)
@@ -864,6 +977,7 @@ def upsert_work(
     synopsis = detail.synopsis if detail else None
     native_title = detail.native_title if detail else None
     tags = detail.tags if detail else []
+    pair = queer_id(conn, tags) if detail else None
     fetched = detail is not None
 
     if mdl_id:
@@ -871,26 +985,27 @@ def upsert_work(
             """
             INSERT INTO work (
                 mdl_id, title, kind, year, episodes, rating, mdl_url, image_url,
-                synopsis, native_title, tags, detail_at
+                synopsis, native_title, tags, queer, detail_at
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::text[], CASE WHEN %s THEN now() ELSE NULL END)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::text[], %s, CASE WHEN %s THEN now() ELSE NULL END)
             ON CONFLICT (mdl_id) DO UPDATE
             SET title = EXCLUDED.title,
                 kind = EXCLUDED.kind,
                 year = EXCLUDED.year,
-                episodes = EXCLUDED.episodes,
+                episodes = COALESCE(EXCLUDED.episodes, work.episodes),
                 rating = EXCLUDED.rating,
                 mdl_url = EXCLUDED.mdl_url,
                 image_url = COALESCE(EXCLUDED.image_url, work.image_url),
                 synopsis = COALESCE(EXCLUDED.synopsis, work.synopsis),
                 native_title = COALESCE(EXCLUDED.native_title, work.native_title),
                 tags = CASE WHEN %s THEN EXCLUDED.tags ELSE work.tags END,
+                queer = CASE WHEN %s THEN EXCLUDED.queer ELSE work.queer END,
                 detail_at = CASE WHEN %s THEN now() ELSE work.detail_at END
             RETURNING id
             """,
             (
                 mdl_id, title, kind, year, episodes, rating, mdl_url, image_url,
-                synopsis, native_title, tags, fetched, fetched, fetched,
+                synopsis, native_title, tags, pair, fetched, fetched, fetched, fetched,
             ),
         ).fetchone()
         return _store_broadcasters(conn, int(row[0]), detail)
@@ -909,19 +1024,20 @@ def upsert_work(
         conn.execute(
             """
             UPDATE work
-            SET episodes = %s,
+            SET episodes = COALESCE(%s, episodes),
                 rating = %s,
                 mdl_url = %s,
                 image_url = COALESCE(%s, image_url),
                 synopsis = COALESCE(%s, synopsis),
                 native_title = COALESCE(%s, native_title),
                 tags = CASE WHEN %s THEN %s::text[] ELSE tags END,
+                queer = CASE WHEN %s THEN %s ELSE queer END,
                 detail_at = CASE WHEN %s THEN now() ELSE detail_at END
             WHERE id = %s
             """,
             (
                 episodes, rating, mdl_url, image_url, synopsis, native_title,
-                fetched, tags or [], fetched, row[0],
+                fetched, tags or [], fetched, pair, fetched, row[0],
             ),
         )
         return _store_broadcasters(conn, int(row[0]), detail)
@@ -929,14 +1045,14 @@ def upsert_work(
         """
         INSERT INTO work (
             title, kind, year, episodes, rating, mdl_url, image_url,
-            synopsis, native_title, tags, detail_at
+            synopsis, native_title, tags, queer, detail_at
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::text[], CASE WHEN %s THEN now() ELSE NULL END)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::text[], %s, CASE WHEN %s THEN now() ELSE NULL END)
         RETURNING id
         """,
         (
             title, kind, year, episodes, rating, mdl_url, image_url,
-            synopsis, native_title, tags, fetched,
+            synopsis, native_title, tags, pair, fetched,
         ),
     ).fetchone()
     return _store_broadcasters(conn, int(row[0]), detail)
@@ -1053,6 +1169,15 @@ def collect_episodes(work_id: int) -> int:
                     item["summary"],
                 ),
             )
+        if episodes:
+            conn.execute(
+                """
+                UPDATE work
+                SET episodes = %s
+                WHERE id = %s AND (episodes IS NULL OR episodes = 0)
+                """,
+                (len(episodes), work_id),
+            )
         conn.commit()
     return len(episodes)
 
@@ -1144,7 +1269,7 @@ def collect_credits(work_id: int) -> int:
     return len(credits)
 
 
-def fetch_credits(slug: str) -> list[dict]:
+def _load_cast(slug: str) -> dict:
     base = os.environ.get("KURYANA_BASE_URL", "https://kuryana.tbdh.app").rstrip("/")
     request = urllib.request.Request(
         f"{base}/v2/dramas/{urllib.parse.quote(slug)}/cast",
@@ -1163,6 +1288,62 @@ def fetch_credits(slug: str) -> list[dict]:
     raw = data.get("cast") if isinstance(data, dict) else None
     if not isinstance(raw, dict):
         raise ValueError("작가·감독 목록이 없습니다")
+    return raw
+
+
+def is_male(mdl_id: str) -> bool:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT gender FROM person WHERE mdl_id = %s",
+            (mdl_id,),
+        ).fetchone()
+    if row is not None and isinstance(row[0], str) and row[0].strip():
+        return row[0].casefold() == "male"
+    body, error = fetch_person(mdl_id)
+    if error is not None or body is None:
+        return False
+    data = body.get("data") if isinstance(body.get("data"), dict) else {}
+    gender = text_or_none(data.get("gender"))
+    return gender is not None and gender.casefold() == "male"
+
+
+def main_cast(slug: str) -> list[dict]:
+    try:
+        people = _load_cast(slug).get("Main Role")
+    except ValueError:
+        return []
+    if not isinstance(people, list):
+        return []
+    found = []
+    seen: set[str] = set()
+    for item in people:
+        if not isinstance(item, dict):
+            continue
+        mdl_id = person_mdl_id(item.get("slug") or "")
+        if mdl_id is None or mdl_id in seen:
+            continue
+        seen.add(mdl_id)
+        found.append({"mdl_id": mdl_id, "character": text_or_none(item.get("character"))})
+    return found
+
+
+def link_main_role(work_id: int, person_id: int, character: str | None) -> None:
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO person_work (person_id, work_id, role, character_name)
+            VALUES (%s, %s, 'Main Role', %s)
+            ON CONFLICT (person_id, work_id, role)
+            DO UPDATE SET character_name = COALESCE(EXCLUDED.character_name, person_work.character_name)
+            """,
+            (person_id, work_id, character),
+        )
+        grant_person_roles(conn, person_id, ("a",))
+        conn.commit()
+
+
+def fetch_credits(slug: str) -> list[dict]:
+    raw = _load_cast(slug)
     credits = []
     seen: set[tuple[str, str]] = set()
     for role, people in raw.items():

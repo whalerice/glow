@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { h } from 'vue'
+import { h, resolveComponent } from 'vue'
 import type { TableColumn } from '@nuxt/ui'
 import type { PersonListRow } from '~/utils/glow'
 import SortHeader from '~/components/SortHeader.vue'
@@ -24,6 +24,7 @@ const pending = ref(false)
 let timer: ReturnType<typeof setTimeout> | undefined
 
 const people = computed(() => data.value?.people || [])
+const q = ref('')
 const sort = ref<SortState | null>(null)
 const page = computed(() => {
   const value = Number(route.query.page)
@@ -46,13 +47,25 @@ function personValue(row: PersonListRow, id: string) {
   if (id === 'name') return row.name || row.native_name || ''
   if (id === 'mdl_id') return Number(row.mdl_id)
   if (id === 'works') return row.works
+  if (id === 'sapphic') return row.sapphic ? 1 : 0
+  if (id === 'wiki') return row.wiki ? 1 : 0
   if (id === 'collected_at') return row.collected_at
-  if (id === 'nationality') return row.nationality
   return row.collect_status
 }
 
-const sorted = computed(() => sortRows(people.value, sort.value, personValue))
+const filtered = computed(() => {
+  const needle = q.value.trim().toLowerCase()
+  if (!needle) return people.value
+  return people.value.filter(row =>
+    `${row.name || ''} ${row.native_name || ''}`.toLowerCase().includes(needle)
+  )
+})
+const sorted = computed(() => sortRows(filtered.value, sort.value, personValue))
 const visible = computed(() => pageRows(sorted.value, page.value))
+
+watch(q, () => {
+  if (page.value !== 1) showPage(1)
+})
 
 watch(
   () => sorted.value.length,
@@ -69,19 +82,80 @@ const bar = computed(() => {
   return Math.floor((progress.value.done * 100) / progress.value.total)
 })
 
+function fixed(width: string) {
+  return {
+    class: { td: 'overflow-hidden' },
+    style: { th: { width }, td: { width } }
+  }
+}
+
+function flag(value: boolean) {
+  if (!value) return ''
+  return h(
+    resolveComponent('UBadge'),
+    { color: 'neutral', variant: 'subtle' },
+    () => '있음'
+  )
+}
+
 const columns = computed<TableColumn<PersonListRow>[]>(() => {
-  const col = (label: string, id: string) => ({
+  const col = (label: string, id: string, width: string) => ({
     accessorKey: id,
-    header: () => h(SortHeader, { label, id, active: sort.value, onSort })
+    header: () => h(SortHeader, { label, id, active: sort.value, onSort }),
+    meta: fixed(width)
   })
   return [
-    { accessorKey: 'image_url', header: '' },
-    col('이름', 'name'),
-    col('MDL id', 'mdl_id'),
-    col('국적', 'nationality'),
-    col('상태', 'collect_status'),
-    col('출연', 'works'),
-    col('수집 시각', 'collected_at')
+    {
+      accessorKey: 'image_url',
+      header: '',
+      meta: {
+        style: {
+          th: { width: '80px', paddingInline: '0' },
+          td: { width: '80px', paddingInline: '0' }
+        }
+      }
+    },
+    {
+      accessorKey: 'name',
+      header: () =>
+        h(SortHeader, {
+          label: '이름',
+          id: 'name',
+          active: sort.value,
+          onSort
+        }),
+      meta: { class: { td: 'whitespace-normal' } }
+    },
+    col('MDL id', 'mdl_id', '96px'),
+    col('상태', 'collect_status', '112px'),
+    {
+      id: 'sapphic',
+      accessorKey: 'sapphic',
+      header: () =>
+        h(SortHeader, {
+          label: 'Sapphic',
+          id: 'sapphic',
+          active: sort.value,
+          onSort
+        }),
+      cell: ({ row }) => flag(row.original.sapphic),
+      meta: fixed('88px')
+    },
+    {
+      id: 'wiki',
+      accessorKey: 'wiki',
+      header: () =>
+        h(SortHeader, {
+          label: '위키',
+          id: 'wiki',
+          active: sort.value,
+          onSort
+        }),
+      cell: ({ row }) => flag(row.original.wiki),
+      meta: fixed('72px')
+    },
+    col('출연', 'works', '80px'),
+    col('수집 시각', 'collected_at', '168px')
   ]
 })
 
@@ -146,10 +220,11 @@ onUnmounted(() => clearTimeout(timer))
       :title="errorText(error)"
       class="mb-4"
     />
-    <div class="mb-4 flex items-end justify-between gap-3">
-      <h1 class="text-xl font-semibold">
-        배우 <span class="text-muted">{{ people.length }}</span>
-      </h1>
+    <div class="mb-4 flex items-center justify-between gap-3">
+      <div class="flex items-center gap-3">
+        <UInput v-model="q" placeholder="이름" class="w-48" />
+        <span class="text-sm text-muted">{{ sorted.length }}명</span>
+      </div>
       <div class="flex items-center gap-2">
         <div v-if="progress?.on" class="min-w-40">
           <p class="text-xs text-muted">
@@ -165,17 +240,26 @@ onUnmounted(() => clearTimeout(timer))
         <UButton @click="showRegister"> 배우 등록 </UButton>
       </div>
     </div>
-    <p v-if="!people.length" class="text-sm text-muted">
-      등록된 배우가 없습니다.
+    <p v-if="!sorted.length" class="text-sm text-muted">
+      {{ q.trim() ? '검색 결과가 없습니다.' : '등록된 배우가 없습니다.' }}
     </p>
-    <UTable v-else :data="visible" :columns="columns">
+    <UTable
+      v-else
+      :data="visible"
+      :columns="columns"
+      :ui="{ base: 'table-fixed' }"
+    >
       <template #image_url-cell="{ row }">
-        <img
+        <span
           v-if="row.original.image_url"
-          :src="row.original.image_url"
-          alt=""
-          class="h-12 w-9 rounded object-cover"
-        />
+          class="relative block aspect-3/4 w-full overflow-hidden rounded"
+        >
+          <img
+            :src="row.original.image_url"
+            alt=""
+            class="absolute inset-0 size-full object-cover"
+          />
+        </span>
       </template>
       <template #name-cell="{ row }">
         <NuxtLink :to="`/people/${row.original.id}`" class="font-medium">
@@ -190,9 +274,6 @@ onUnmounted(() => clearTimeout(timer))
           class="block text-xs text-muted"
           >{{ row.original.native_name }}</span
         >
-      </template>
-      <template #nationality-cell="{ row }">
-        {{ row.original.nationality || '' }}
       </template>
       <template #collect_status-cell="{ row }">
         <UBadge

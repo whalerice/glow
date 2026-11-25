@@ -13,13 +13,16 @@ type Work = {
   image_url: string | null
   synopsis: string | null
   native_title: string | null
+  ko_title: string | null
   tags: string[] | null
+  keywords: string[] | null
   aired: string | null
   aired_on: string | null
   content_rating: string | null
   homepage: string | null
   tmdb_id: number | null
   tmdb_kind: string | null
+  deleted: number
 }
 
 type Cast = {
@@ -106,7 +109,14 @@ const episodeColumns: TableColumn<Episode>[] = [
   { accessorKey: 'title', header: '제목' },
   { accessorKey: 'air_date', header: '방영' },
   { accessorKey: 'rating', header: '평점' },
-  { accessorKey: 'summary', header: '설명' }
+  {
+    accessorKey: 'summary',
+    header: '설명',
+    meta: {
+      class: { td: 'whitespace-normal' },
+      style: { th: { width: '36%' }, td: { width: '36%' } }
+    }
+  }
 ]
 const castColumns: TableColumn<Cast>[] = [
   { accessorKey: 'name', header: '배우' },
@@ -118,12 +128,20 @@ function providers(country: string) {
   return (data.value?.providers || []).filter(row => row.country === country)
 }
 
+async function removeWork() {
+  if (!confirm('이 작품을 삭제합니다. 배우와 회사는 남습니다.')) return
+  await run(`/api/works/${id.value}/delete`)
+}
+
 async function run(path: string, body: Record<string, string> = {}) {
   message.value = ''
   pending.value = path
   try {
     await $fetch(path, { method: 'POST', body })
-    if (path.endsWith('/exception')) {
+    if (
+      path.endsWith('/delete') ||
+      (path.endsWith('/exception') && body.deleted !== '0')
+    ) {
       await navigateTo(worksList())
       return
     }
@@ -158,17 +176,33 @@ async function run(path: string, body: Record<string, string> = {}) {
             <h1 class="text-2xl font-semibold">
               {{ data.work.title }}
             </h1>
-            <UButton
-              color="neutral"
-              variant="outline"
-              @click="run(`/api/works/${id}/exception`)"
-            >
-              예외
-            </UButton>
+            <div class="flex gap-2">
+              <UButton
+                v-if="data.work.deleted === 1"
+                @click="run(`/api/works/${id}/exception`, { deleted: '0' })"
+              >
+                추가
+              </UButton>
+              <UButton
+                v-else
+                color="neutral"
+                variant="outline"
+                @click="run(`/api/works/${id}/exception`)"
+              >
+                예외
+              </UButton>
+              <UButton color="error" variant="outline" @click="removeWork">
+                삭제
+              </UButton>
+            </div>
           </div>
           <p class="mt-2 text-sm text-muted">원제</p>
           <p class="text-lg">
             {{ data.work.native_title || '없음' }}
+          </p>
+          <p v-if="data.work.ko_title" class="mt-2 text-sm text-muted">한글명</p>
+          <p v-if="data.work.ko_title" class="text-lg">
+            {{ data.work.ko_title }}
           </p>
           <dl class="mt-4 grid grid-cols-2 gap-x-6 gap-y-2 text-sm">
             <div>
@@ -309,6 +343,22 @@ async function run(path: string, body: Record<string, string> = {}) {
               >
             </div>
           </div>
+          <div v-if="data.work.keywords" class="mt-4">
+            <p class="text-sm text-muted">키워드</p>
+            <div class="mt-2 flex flex-wrap gap-2">
+              <UBadge
+                v-for="keyword in data.work.keywords"
+                :key="keyword"
+                color="neutral"
+                variant="subtle"
+              >
+                {{ keyword }}
+              </UBadge>
+              <span v-if="!data.work.keywords.length" class="text-sm text-muted"
+                >없음</span
+              >
+            </div>
+          </div>
           <p v-if="data.work.mdl_url" class="mt-3 text-sm text-muted">
             출처 <span class="font-medium text-default">MyDramaList</span>
             <a
@@ -409,7 +459,12 @@ async function run(path: string, body: Record<string, string> = {}) {
       <p v-if="!data.episodes.length" class="px-4 py-6 text-sm text-muted">
         가져온 에피소드가 없습니다.
       </p>
-      <UTable v-else :data="data.episodes" :columns="episodeColumns">
+      <UTable
+        v-else
+        :data="data.episodes"
+        :columns="episodeColumns"
+        :ui="{ base: 'table-fixed' }"
+      >
         <template #image_url-cell="{ row }">
           <img
             v-if="row.original.image_url"
@@ -438,7 +493,7 @@ async function run(path: string, body: Record<string, string> = {}) {
           {{ row.original.rating ?? '' }}
         </template>
         <template #summary-cell="{ row }">
-          <span class="max-w-md">{{ row.original.summary || '' }}</span>
+          <p class="whitespace-pre-line">{{ row.original.summary || '' }}</p>
         </template>
       </UTable>
     </section>

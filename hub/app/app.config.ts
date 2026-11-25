@@ -12,6 +12,11 @@ export default defineAppConfig({
         base: 'cursor-pointer'
       }
     },
+    table: {
+      slots: {
+        td: 'p-3'
+      }
+    },
     icons: {
       arrowDown: 'i-lucide-arrow-down',
       arrowLeft: 'i-lucide-arrow-left',

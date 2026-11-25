@@ -144,11 +144,13 @@ def providers(kind: str, tmdb_id: int) -> list[tuple[str, str, str, str | None, 
 
 
 def enrich_companies(conn, work_id: int, kind: str, tmdb_id: int) -> None:
-    data = _get(f"/{kind}/{tmdb_id}", {})
+    data = _get(f"/{kind}/{tmdb_id}", {"append_to_response": "keywords,translations"})
+    names = keyword_names(data.get("keywords"))
     conn.execute(
-        "UPDATE work SET homepage = %s WHERE id = %s",
-        (_http(data.get("homepage")), work_id),
+        "UPDATE work SET homepage = %s, keywords = %s::text[], ko_title = %s WHERE id = %s",
+        (_http(data.get("homepage")), names, ko_title(data), work_id),
     )
+    apply_gl_keyword(conn, work_id, names)
     networks = data.get("networks") if isinstance(data.get("networks"), list) else []
     studios = data.get("production_companies") if isinstance(data.get("production_companies"), list) else []
     companies = list(conn.execute("SELECT id, name, logo_url, homepage FROM company").fetchall())
@@ -227,6 +229,131 @@ def _profile(resource: str, raw_id: object) -> tuple[str | None, str | None]:
     else:
         home = home.strip()
     return _logo_url(data.get("logo_path")), home
+
+
+def fill_ko_titles() -> None:
+    from app.collect import connect
+
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, tmdb_kind, tmdb_id FROM work
+            WHERE tmdb_id IS NOT NULL AND ko_title IS NULL
+            ORDER BY id
+            """
+        ).fetchall()
+    for work_id, raw_kind, tmdb_id in rows:
+        kind = raw_kind if raw_kind in ("movie", "tv") else "tv"
+        try:
+            data = _get(f"/{kind}/{tmdb_id}/translations", {})
+        except ValueError:
+            continue
+        with connect() as conn:
+            conn.execute(
+                "UPDATE work SET ko_title = %s WHERE id = %s AND ko_title IS NULL",
+                (ko_title(data), work_id),
+            )
+            conn.commit()
+
+
+def ko_title(data: object) -> str:
+    block = data.get("translations") if isinstance(data, dict) else None
+    if isinstance(block, dict):
+        data = block
+    items = data.get("translations") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        return ""
+    fallback = ""
+    for item in items:
+        if not isinstance(item, dict) or item.get("iso_639_1") != "ko":
+            continue
+        payload = item.get("data") if isinstance(item.get("data"), dict) else {}
+        text = payload.get("title") or payload.get("name")
+        if not isinstance(text, str) or not text.strip():
+            continue
+        title = text.strip()
+        if item.get("iso_3166_1") == "KR":
+            return title
+        fallback = title
+    return fallback
+
+
+def fill_keywords() -> None:
+    from app.collect import connect
+
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, tmdb_kind, tmdb_id FROM work
+            WHERE tmdb_id IS NOT NULL AND keywords IS NULL
+            ORDER BY id
+            """
+        ).fetchall()
+    for work_id, raw_kind, tmdb_id in rows:
+        kind = raw_kind if raw_kind in ("movie", "tv") else "tv"
+        try:
+            data = _get(f"/{kind}/{tmdb_id}/keywords", {})
+        except ValueError:
+            continue
+        names = keyword_names(data)
+        with connect() as conn:
+            conn.execute(
+                "UPDATE work SET keywords = %s::text[] WHERE id = %s AND keywords IS NULL",
+                (names, work_id),
+            )
+            apply_gl_keyword(conn, work_id, names)
+            conn.commit()
+
+
+_GL_KEYWORDS = {"girls' love (gl)", "girls' love", "gl"}
+
+
+def _keyword_key(name: str) -> str:
+    return name.casefold().replace("\u2019", "'").replace("\u2018", "'").strip()
+
+
+def apply_gl_keyword(conn, work_id: int, names: list[str]) -> None:
+    if not any(_keyword_key(name) in _GL_KEYWORDS for name in names):
+        return
+    conn.execute(
+        """
+        UPDATE work
+        SET queer = (
+            SELECT id FROM queer
+            WHERE name = CASE
+                WHEN 'Gay Romance' = ANY (tags) OR 'Gay Male Lead' = ANY (tags) THEN 'LGBTQ'
+                ELSE 'GL'
+            END
+        )
+        WHERE id = %s
+        """,
+        (work_id,),
+    )
+
+
+def keyword_names(data: object) -> list[str]:
+    if isinstance(data, dict) and isinstance(data.get("keywords"), dict):
+        data = data["keywords"]
+    items = data.get("keywords") if isinstance(data, dict) else None
+    if not isinstance(items, list) and isinstance(data, dict):
+        items = data.get("results")
+    if not isinstance(items, list):
+        return []
+    names: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        if not isinstance(name, str):
+            continue
+        text = name.strip()
+        key = text.casefold()
+        if not text or key in seen:
+            continue
+        seen.add(key)
+        names.append(text)
+    return names
 
 
 def _http(value: object) -> str | None:

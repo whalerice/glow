@@ -9,6 +9,8 @@ export type PersonListRow = {
   collected_at: string | null
   works: number
   hidden: number
+  sapphic: boolean
+  wiki: boolean
 }
 
 export type SourceRow = {
@@ -64,18 +66,6 @@ export function creditLabels(roles: string[] | null) {
 
 export function creditLabel(role: string) {
   return CREDIT_LABEL[role] || role
-}
-
-export function pairTags(tags: string[] | null) {
-  const values = new Set(tags || [])
-  const labels: string[] = []
-  if (values.has('Lesbian Romance')) labels.push('GL')
-  if (
-    (values.has('Gay Romance') || values.has('Gay Male Lead')) &&
-    !labels.includes('BL')
-  )
-    labels.push('BL')
-  return labels
 }
 
 export function statusColor(status: string) {
