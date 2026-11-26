@@ -22,6 +22,13 @@ type Work = {
   homepage: string | null
   tmdb_id: number | null
   tmdb_kind: string | null
+  tmdb_status: string | null
+  next_season: number | null
+  next_episode: number | null
+  next_air_date: string | null
+  poster_url: string | null
+  backdrop_url: string | null
+  backdrop_urls: string[] | null
   deleted: number
 }
 
@@ -55,6 +62,7 @@ type Provider = {
   url: string | null
 }
 type Network = { id: number; name: string }
+type Watch = { name: string; offer: string; url: string | null }
 type Payload = {
   work: Work
   cast: Cast[]
@@ -62,6 +70,7 @@ type Payload = {
   credits: Credit[]
   providers: Provider[]
   networks: Network[]
+  watches: Watch[]
 }
 
 const route = useRoute()
@@ -93,6 +102,21 @@ watch(
   },
   { immediate: true }
 )
+
+const tmdbUrl = computed(() => {
+  const work = data.value?.work
+  if (work?.tmdb_id == null) return ''
+  if (work.tmdb_kind !== 'tv' && work.tmdb_kind !== 'movie') return ''
+  return `https://www.themoviedb.org/${work.tmdb_kind}/${work.tmdb_id}`
+})
+
+const backdrops = computed(() => {
+  const work = data.value?.work
+  if (!work) return []
+  const urls = (work.backdrop_urls ?? []).filter(url => httpUrl(url))
+  if (urls.length) return urls
+  return httpUrl(work.backdrop_url) ? [work.backdrop_url as string] : []
+})
 
 const kinds = [
   { label: 'tv', value: 'tv' },
@@ -126,6 +150,30 @@ const castColumns: TableColumn<Cast>[] = [
 
 function providers(country: string) {
   return (data.value?.providers || []).filter(row => row.country === country)
+}
+
+const collecting = ref(false)
+
+async function recollect() {
+  if (!confirm('이 작품을 재수집합니다.')) return
+  collecting.value = true
+  message.value = ''
+  try {
+    await $fetch('/api/works/collect', {
+      method: 'POST',
+      body: { ids: [Number(id.value)] }
+    })
+    for (;;) {
+      const body = await $fetch<{ on: boolean }>('/api/works/collect/progress')
+      if (!body.on) break
+      await new Promise(resolve => setTimeout(resolve, 2000))
+    }
+    await refresh()
+  } catch (err) {
+    message.value = errorText(err)
+  } finally {
+    collecting.value = false
+  }
 }
 
 async function removeWork() {
@@ -164,10 +212,35 @@ async function run(path: string, body: Record<string, string> = {}) {
   <div v-else-if="data">
     <NuxtLink to="/works" class="text-sm text-muted"> 작품 </NuxtLink>
     <section class="mt-3 rounded-lg border border-default bg-default p-6">
+      <UCarousel
+        v-if="backdrops.length"
+        v-slot="{ item }"
+        :items="backdrops"
+        :arrows="backdrops.length > 1"
+        :dots="backdrops.length > 1"
+        class="mb-10 w-full"
+        :ui="{
+          item: 'basis-full',
+          prev: 'start-3 sm:start-3',
+          next: 'end-3 sm:end-3'
+        }"
+      >
+        <img
+          :src="String(item)"
+          alt=""
+          class="h-44 w-full rounded-md object-cover sm:h-72 lg:h-96"
+        />
+      </UCarousel>
       <div class="flex gap-5">
         <img
           v-if="data.work.image_url"
           :src="data.work.image_url"
+          alt=""
+          class="h-44 w-32 rounded-md object-cover"
+        />
+        <img
+          v-if="httpUrl(data.work.poster_url)"
+          :src="data.work.poster_url!"
           alt=""
           class="h-44 w-32 rounded-md object-cover"
         />
@@ -177,6 +250,14 @@ async function run(path: string, body: Record<string, string> = {}) {
               {{ data.work.title }}
             </h1>
             <div class="flex gap-2">
+              <UButton
+                color="neutral"
+                variant="outline"
+                :loading="collecting"
+                @click="recollect"
+              >
+                재수집
+              </UButton>
               <UButton
                 v-if="data.work.deleted === 1"
                 @click="run(`/api/works/${id}/exception`, { deleted: '0' })"
@@ -233,6 +314,16 @@ async function run(path: string, body: Record<string, string> = {}) {
               <dt class="text-muted">방영일</dt>
               <dd>{{ data.work.aired_on }}</dd>
             </div>
+            <div v-if="data.work.tmdb_status">
+              <dt class="text-muted">상태</dt>
+              <dd>{{ data.work.tmdb_status }}</dd>
+            </div>
+            <div v-if="data.work.next_episode != null || data.work.next_air_date">
+              <dt class="text-muted">다음 회차</dt>
+              <dd>
+                <template v-if="data.work.next_season != null">{{ data.work.next_season }}기 </template><template v-if="data.work.next_episode != null">{{ data.work.next_episode }}화</template><template v-if="data.work.next_air_date">{{ ' ' + data.work.next_air_date }}</template>
+              </dd>
+            </div>
             <div v-if="data.work.content_rating">
               <dt class="text-muted">등급</dt>
               <dd>{{ data.work.content_rating }}</dd>
@@ -267,6 +358,27 @@ async function run(path: string, body: Record<string, string> = {}) {
                     >,
                   </template>
                 </NuxtLink>
+              </dd>
+            </div>
+            <div v-if="data.watches.length" class="col-span-2">
+              <dt class="text-muted">Where to Watch</dt>
+              <dd>
+                <div
+                  v-for="row in data.watches"
+                  :key="`${row.name}-${row.offer}`"
+                  class="mt-1 flex items-center gap-2"
+                >
+                  <a
+                    v-if="httpUrl(row.url)"
+                    class="underline"
+                    :href="row.url!"
+                    target="_blank"
+                    rel="noreferrer"
+                    >{{ row.name }}</a
+                  >
+                  <span v-else>{{ row.name }}</span>
+                  <UBadge color="neutral" variant="subtle">{{ row.offer }}</UBadge>
+                </div>
               </dd>
             </div>
             <div class="col-span-2">
@@ -359,15 +471,27 @@ async function run(path: string, body: Record<string, string> = {}) {
               >
             </div>
           </div>
-          <p v-if="data.work.mdl_url" class="mt-3 text-sm text-muted">
-            출처 <span class="font-medium text-default">MyDramaList</span>
-            <a
-              class="underline"
-              :href="data.work.mdl_url"
-              target="_blank"
-              rel="noreferrer"
-              >원문</a
-            >
+          <p
+            v-if="data.work.mdl_url || tmdbUrl"
+            class="mt-3 flex flex-wrap items-center gap-x-3 text-sm text-muted"
+          >
+            <span>출처</span>
+            <span v-if="data.work.mdl_url">
+              <span class="font-medium text-default">MyDramaList</span>
+              <a
+                class="underline"
+                :href="data.work.mdl_url"
+                target="_blank"
+                rel="noreferrer"
+                >원문</a
+              >
+            </span>
+            <span v-if="tmdbUrl">
+              <span class="font-medium text-default">TMDB</span>
+              <a class="underline" :href="tmdbUrl" target="_blank" rel="noreferrer"
+                >원문</a
+              >
+            </span>
           </p>
           <h2 v-if="data.work.synopsis" class="mt-4 text-sm font-semibold">
             설명

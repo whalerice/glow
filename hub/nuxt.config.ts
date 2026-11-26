@@ -13,6 +13,7 @@ export default defineNuxtConfig({
   css: ['~/assets/css/main.css'],
 
   ui: {
+    fonts: false,
     eslint: {
       rules: {
         'no-unknown-classes': 'error',
@@ -37,12 +38,7 @@ export default defineNuxtConfig({
     }
   },
 
-  fonts: {
-    families: [
-      { name: 'Roboto', weights: [400, 500, 700] },
-      { name: 'BusanDandiGothic', provider: 'none' }
-    ]
-  },
+  fonts: false,
 
   icon: {
     clientBundle: {
@@ -51,7 +47,9 @@ export default defineNuxtConfig({
         'lucide:clapperboard',
         'lucide:pen-line',
         'lucide:building-2',
-        'lucide:sparkles'
+        'lucide:sparkles',
+        'lucide:arrow-left',
+        'lucide:arrow-right'
       ]
     }
   }

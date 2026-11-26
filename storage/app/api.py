@@ -14,9 +14,12 @@ from app.collect import (
     collect_credits,
     collect_episodes,
     connect,
+    drama_slug,
     register,
     register_work,
+    refresh_work,
     save_drama_detail,
+    save_where_to_watch,
 )
 from app.fandom import SOURCE as FANDOM_SOURCE
 from app.fandom import fetch_page, search as fandom_search, selected_payload as fandom_payload
@@ -85,13 +88,18 @@ def _route(method: str, path: str, query: dict, body: dict) -> tuple[int, dict]:
         return 200, {"people": listed_people()}
     if path == "/api/people" and method == "POST":
         return 200, _register(body)
+    if path == "/api/works/collect" and method == "POST":
+        start_tmdb_collect(_ids(body))
+        return 202, tmdb_progress()
+    if path == "/api/works/collect/progress" and method == "GET":
+        return 200, tmdb_progress()
     if path == "/api/works/episodes" and method == "POST":
         start_episode_collect()
         return 202, episode_progress()
     if path == "/api/works/episodes/progress" and method == "GET":
         return 200, episode_progress()
     if path == "/api/works" and method == "GET":
-        return 200, works_payload(_one(query, "deleted", "0"))
+        return 200, works_payload(query)
     if path == "/api/works" and method == "POST":
         return 200, _register_work(body)
     if path == "/api/works/exception" and method == "POST":
@@ -158,7 +166,9 @@ def _route(method: str, path: str, query: dict, body: dict) -> tuple[int, dict]:
         collect_credits(int(work_credits.group(1)))
         return 200, {"ok": True}
     if work_tmdb and method == "POST":
-        save_tmdb(int(work_tmdb.group(1)), str(body.get("tmdb_id") or ""), str(body.get("tmdb_kind") or ""))
+        work_id = int(work_tmdb.group(1))
+        save_tmdb(work_id, str(body.get("tmdb_id") or ""), str(body.get("tmdb_kind") or ""))
+        _save_mdl_watch(work_id)
         return 200, {"ok": True}
     if work and method == "GET":
         return 200, work_payload(int(work.group(1)))
@@ -262,6 +272,55 @@ _EP_ON = False
 _EP_DONE = 0
 _EP_TOTAL = 0
 _EP_NAME = ""
+
+
+_TMDB_LOCK = Lock()
+_TMDB_ON = False
+_TMDB_DONE = 0
+_TMDB_TOTAL = 0
+_TMDB_NAME = ""
+
+
+def tmdb_progress() -> dict:
+    with _TMDB_LOCK:
+        return {"on": _TMDB_ON, "done": _TMDB_DONE, "total": _TMDB_TOTAL, "name": _TMDB_NAME}
+
+
+def start_tmdb_collect(ids: list[int]) -> None:
+    global _TMDB_ON, _TMDB_DONE, _TMDB_TOTAL, _TMDB_NAME
+    if not ids:
+        return
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT id, title FROM work WHERE id = ANY(%s) ORDER BY id",
+            (ids,),
+        ).fetchall()
+    with _TMDB_LOCK:
+        if _TMDB_ON or not rows:
+            return
+        _TMDB_ON = True
+        _TMDB_DONE = 0
+        _TMDB_TOTAL = len(rows)
+        _TMDB_NAME = rows[0][1]
+    Thread(target=_recollect_tmdb, args=(rows,), daemon=True).start()
+
+
+def _recollect_tmdb(rows: list) -> None:
+    global _TMDB_ON, _TMDB_DONE, _TMDB_NAME
+    try:
+        for index, (work_id, title) in enumerate(rows):
+            with _TMDB_LOCK:
+                _TMDB_NAME = title or ""
+                _TMDB_DONE = index
+            try:
+                refresh_work(int(work_id))
+            except Exception:
+                continue
+        with _TMDB_LOCK:
+            _TMDB_DONE = len(rows)
+    finally:
+        with _TMDB_LOCK:
+            _TMDB_ON = False
 
 
 def episode_progress() -> dict:
@@ -402,11 +461,28 @@ def hide_works(ids: list[int], deleted: int) -> int:
     return cursor.rowcount
 
 
+def _save_mdl_watch(work_id: int) -> None:
+    try:
+        with connect() as conn:
+            row = conn.execute(
+                "SELECT mdl_url FROM work WHERE id = %s",
+                (work_id,),
+            ).fetchone()
+        if row is None:
+            return
+        slug = drama_slug(row[0])
+        if slug is None:
+            return
+        save_where_to_watch(work_id, slug)
+    except Exception:
+        pass
+
+
 def delete_works(ids: list[int]) -> int:
     if not ids:
         return 0
     with connect() as conn:
-        for table in ("episode", "person_work", "work_company", "work_provider"):
+        for table in ("episode", "person_work", "work_company", "work_provider", "work_watch"):
             conn.execute(f"DELETE FROM {table} WHERE work_id = ANY(%s)", (ids,))
         cursor = conn.execute("DELETE FROM work WHERE id = ANY(%s)", (ids,))
         conn.commit()
@@ -418,7 +494,7 @@ def delete_work(work_id: int) -> bool:
         found = conn.execute("SELECT 1 FROM work WHERE id = %s", (work_id,)).fetchone()
         if found is None:
             return False
-        for table in ("episode", "person_work", "work_company", "work_provider"):
+        for table in ("episode", "person_work", "work_company", "work_provider", "work_watch"):
             conn.execute(f"DELETE FROM {table} WHERE work_id = %s", (work_id,))
         conn.execute("DELETE FROM work WHERE id = %s", (work_id,))
         conn.commit()
@@ -490,24 +566,116 @@ def person_payload(person_id: int) -> dict:
     }
 
 
-def works_payload(mode: str) -> dict:
+_PAGE_SIZES = (20, 50, 100)
+_STATUSES = {
+    "Returning Series",
+    "Planned",
+    "In Production",
+    "Post Production",
+    "Pilot",
+    "Ended",
+    "Canceled",
+    "Released",
+    "Rumored",
+}
+_SORTS = {
+    "title": "w.title",
+    "queer": "queer.name",
+    "kind": "CASE w.kind WHEN 'drama' THEN '드라마' WHEN 'movie' THEN '영화' WHEN 'tv_show' THEN 'TV 쇼' ELSE w.kind END",
+    "year": "w.year",
+    "episodes": "w.episodes",
+    "rating": "w.rating",
+    "tmdb_status": "w.tmdb_status",
+    "cast_count": "cast_count",
+}
+
+
+def _page(query: dict) -> int:
+    try:
+        page = int(_one(query, "page", "1"))
+    except ValueError:
+        return 1
+    return page if page > 0 else 1
+
+
+def _page_size(query: dict) -> int:
+    try:
+        size = int(_one(query, "size", "20"))
+    except ValueError:
+        return 20
+    return size if size in _PAGE_SIZES else 20
+
+
+def _like(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
+def works_payload(query: dict) -> dict:
+    mode = _one(query, "deleted", "0")
     if mode not in ("all", "0", "1"):
         mode = "0"
-    where = {"all": "", "0": "WHERE w.deleted = 0", "1": "WHERE w.deleted = 1"}[mode]
+    page = _page(query)
+    size = _page_size(query)
+    needle = _one(query, "q", "").strip()
+    queer = _one(query, "queer", "")
+    status = _one(query, "status", "")
+    sort = _one(query, "sort", "")
+    desc = _one(query, "dir", "") == "desc"
+    filters: list[str] = []
+    params: list = []
+    if mode == "0":
+        filters.append("w.deleted = 0")
+    elif mode == "1":
+        filters.append("w.deleted = 1")
+    if needle:
+        filters.append("(w.title ILIKE %s ESCAPE '\\' OR w.ko_title ILIKE %s ESCAPE '\\')")
+        like = _like(needle)
+        params.extend((like, like))
+    if queer == "none":
+        filters.append("w.queer IS NULL")
+    elif queer in ("BL", "GL", "LGBTQ"):
+        filters.append("queer.name = %s")
+        params.append(queer)
+    if status == "none":
+        filters.append("(w.tmdb_status IS NULL OR btrim(w.tmdb_status) = '')")
+    elif status in _STATUSES:
+        filters.append("w.tmdb_status = %s")
+        params.append(status)
+    where = f"WHERE {' AND '.join(filters)}" if filters else ""
+    if sort == "tmdb_id":
+        order = "(w.tmdb_id IS NULL), w.year DESC NULLS FIRST, w.title"
+    elif sort in _SORTS:
+        direction = "DESC" if desc else "ASC"
+        order = f"{_SORTS[sort]} {direction} NULLS LAST, w.year DESC NULLS FIRST, w.title"
+    else:
+        order = "w.year DESC NULLS FIRST, w.title"
     with connect() as conn:
         conn.row_factory = dict_row
+        total = int(
+            conn.execute(
+                f"""
+                SELECT count(*)
+                FROM work w
+                LEFT JOIN queer ON queer.id = w.queer
+                {where}
+                """,
+                params,
+            ).fetchone()["count"]
+        )
         rows = conn.execute(
             f"""
             SELECT w.id, w.title, w.ko_title, w.kind, w.year, w.episodes, w.rating, w.image_url, w.tags,
-                   w.queer, queer.name AS queer_name, w.tmdb_id, w.deleted,
+                   w.queer, queer.name AS queer_name, w.tmdb_id, w.tmdb_status, w.deleted,
                    (SELECT count(*) FROM person_work pw
                     WHERE pw.work_id = w.id AND NOT (pw.role = ANY(%s))) AS cast_count
             FROM work w
             LEFT JOIN queer ON queer.id = w.queer
             {where}
-            ORDER BY w.year DESC NULLS FIRST, w.title
+            ORDER BY {order}
+            LIMIT %s OFFSET %s
             """,
-            (list(CREDIT_ROLES),),
+            [list(CREDIT_ROLES), *params, size, (page - 1) * size],
         ).fetchall()
         faces: dict[int, list[dict]] = {}
         ids = [row["id"] for row in rows]
@@ -536,7 +704,12 @@ def works_payload(mode: str) -> dict:
                 )
         for row in rows:
             row["cast"] = faces.get(row["id"], [])
-    return {"deleted": mode, "works": _counts(rows, "cast_count")}
+    return {
+        "deleted": mode,
+        "page": page,
+        "total": total,
+        "works": _counts(rows, "cast_count"),
+    }
 
 
 def work_payload(work_id: int) -> dict:
@@ -602,6 +775,15 @@ def work_payload(work_id: int) -> dict:
             """,
             (work_id,),
         ).fetchall()
+        watches = conn.execute(
+            """
+            SELECT name, offer, url
+            FROM work_provider
+            WHERE work_id = %s AND country = ''
+            ORDER BY name, offer
+            """,
+            (work_id,),
+        ).fetchall()
     order = {role: index for index, role in enumerate(CREDIT_ROLES)}
     credits.sort(key=lambda row: (order.get(row["role"], len(order)), row["name"] or ""))
     return {
@@ -611,6 +793,7 @@ def work_payload(work_id: int) -> dict:
         "credits": credits,
         "providers": providers,
         "networks": networks,
+        "watches": watches,
     }
 
 

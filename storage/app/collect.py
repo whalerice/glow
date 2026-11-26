@@ -562,6 +562,31 @@ def register_work(raw_id: str) -> tuple[int, str, bool]:
             conn.commit()
             return int(found[0]), mdl_id, True
         conn.commit()
+    return _collect_work(mdl_id), mdl_id, False
+
+
+def refresh_work(work_id: int) -> str:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT title, mdl_id FROM work WHERE id = %s",
+            (work_id,),
+        ).fetchone()
+    if row is None:
+        return ""
+    title, mdl_id = row
+    name = title if isinstance(title, str) else ""
+    if isinstance(mdl_id, str) and mdl_id.strip():
+        _collect_work(mdl_id.strip(), cast=False)
+    try:
+        from app.tmdb import recollect
+
+        recollect(work_id)
+    except Exception:
+        pass
+    return name
+
+
+def _collect_work(mdl_id: str, cast: bool = True) -> int:
     slug = mdl_id
     data = load_drama(slug)
     if data is None:
@@ -588,15 +613,22 @@ def register_work(raw_id: str) -> tuple[int, str, bool]:
             collect_episodes(work_id)
         except Exception:
             pass
-    for item in main_cast(slug):
-        if is_male(item["mdl_id"]):
-            continue
-        try:
-            result = register(item["mdl_id"])
-        except Exception:
-            continue
-        link_main_role(work_id, result.person_id, item["character"])
-    return work_id, mdl_id, False
+    if cast:
+        for item in main_cast(slug):
+            if is_male(item["mdl_id"]):
+                continue
+            try:
+                result = register(item["mdl_id"])
+            except Exception:
+                continue
+            link_main_role(work_id, result.person_id, item["character"])
+    else:
+        save_missing_main_roles(work_id, slug)
+    try:
+        save_where_to_watch(work_id, slug)
+    except Exception:
+        pass
+    return work_id
 
 
 def work_kind(value: object) -> str:
@@ -1123,6 +1155,121 @@ def text_or_none(value: object) -> str | None:
     return text or None
 
 
+def _watch_offer(text: str) -> str | None:
+    head = text.strip().casefold()
+    if head.startswith("subscription"):
+        return "유료 구독"
+    if head.startswith("free"):
+        return "무료"
+    return None
+
+
+def _split_watch(name: str, offer: str) -> tuple[str, str] | None:
+    label = name.strip()
+    extra = offer.strip()
+    if extra:
+        label = f"{label} {extra}"
+    match = re.search(r"\b(subscription|free)\b", label, re.I)
+    if match is None:
+        return None
+    provider = label[: match.start()].strip(" -")
+    mapped = _watch_offer(label[match.start() :])
+    if not provider or mapped is None:
+        return None
+    return provider, mapped
+
+
+def where_to_watch(slug: str) -> list[tuple[str, str, str | None]] | None:
+    try:
+        response = cffi_requests.get(
+            f"https://mydramalist.com/{slug}",
+            impersonate="chrome110",
+            timeout=20,
+        )
+    except Exception:
+        return None
+    if response.status_code != 200:
+        return None
+    soup = BeautifulSoup(response.text, "html.parser")
+    box = None
+    for header in soup.select("h3"):
+        if header.get_text(strip=True).startswith("Where to Watch"):
+            box = header.find_parent("div", class_="box")
+            break
+    if box is None:
+        return []
+    rows: list[tuple[str, str, str | None]] = []
+    seen: set[tuple[str, str]] = set()
+    for col in box.select("div.box-body div.col-xs-12.col-lg-4"):
+        link = col.select_one("a.text-primary")
+        if link is None:
+            continue
+        name = link.get_text(strip=True)
+        offer = ""
+        for node in col.select("div.p-l > div"):
+            text = node.get_text(" ", strip=True)
+            if text and text != name:
+                offer = text
+                break
+        if not name or not offer:
+            continue
+        key = (name, offer)
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append((name, offer, _watch_url(link.get("href"))))
+    return rows
+
+
+def _watch_url(href: object) -> str | None:
+    if not isinstance(href, str) or "q=" not in href:
+        return None
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(href).query).get("q", [""])[0]
+    target = urllib.parse.unquote(query)
+    if not target.startswith(("http://", "https://")):
+        return None
+    return target
+
+
+def save_where_to_watch(work_id: int, slug: str) -> None:
+    found = where_to_watch(slug)
+    if found is None:
+        return
+    rows: list[tuple[str, str, str | None]] = []
+    seen: set[tuple[str, str]] = set()
+    for name, offer, url in found:
+        split = _split_watch(name, offer)
+        if split is None:
+            continue
+        provider, mapped = split
+        if (provider, mapped) in seen:
+            continue
+        seen.add((provider, mapped))
+        rows.append((provider, mapped, url))
+    with connect() as conn:
+        conn.execute(
+            "DELETE FROM work_provider WHERE work_id = %s AND country = %s",
+            (work_id, ""),
+        )
+        for name, offer, url in rows:
+            conn.execute(
+                """
+                INSERT INTO work_provider (work_id, country, name, offer, url)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT DO NOTHING
+                """,
+                (work_id, "", name, offer, url),
+            )
+        from app.tmdb import _save_provider_companies
+
+        _save_provider_companies(
+            conn,
+            [("", name, offer, url, None) for name, offer, url in rows],
+        )
+        conn.execute("DELETE FROM work_watch WHERE work_id = %s", (work_id,))
+        conn.commit()
+
+
 def drama_slug(mdl_url: str | None) -> str | None:
     if not mdl_url:
         return None
@@ -1325,6 +1472,41 @@ def main_cast(slug: str) -> list[dict]:
         seen.add(mdl_id)
         found.append({"mdl_id": mdl_id, "character": text_or_none(item.get("character"))})
     return found
+
+
+def _main_actor(work_id: int, mdl_id: str) -> tuple[int | None, bool]:
+    with connect() as conn:
+        row = conn.execute(
+            """
+            SELECT p.id,
+                   EXISTS (
+                     SELECT 1 FROM person_work pw
+                     WHERE pw.person_id = p.id AND pw.work_id = %s AND pw.role = 'Main Role'
+                   )
+            FROM person p
+            WHERE p.mdl_id = %s
+            """,
+            (work_id, mdl_id),
+        ).fetchone()
+    if row is None:
+        return None, False
+    return int(row[0]), bool(row[1])
+
+
+def save_missing_main_roles(work_id: int, slug: str) -> None:
+    for item in main_cast(slug):
+        mdl_id = item["mdl_id"]
+        if is_male(mdl_id):
+            continue
+        person_id, linked = _main_actor(work_id, mdl_id)
+        if linked:
+            continue
+        if person_id is None:
+            try:
+                person_id = register(mdl_id).person_id
+            except Exception:
+                continue
+        link_main_role(work_id, person_id, item["character"])
 
 
 def link_main_role(work_id: int, person_id: int, character: str | None) -> None:

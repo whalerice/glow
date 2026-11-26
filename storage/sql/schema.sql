@@ -60,6 +60,13 @@ ALTER TABLE work ADD COLUMN IF NOT EXISTS tmdb_kind text;
 ALTER TABLE work ADD COLUMN IF NOT EXISTS keywords text[];
 ALTER TABLE work ADD COLUMN IF NOT EXISTS ko_title text;
 ALTER TABLE work ADD COLUMN IF NOT EXISTS homepage text;
+ALTER TABLE work ADD COLUMN IF NOT EXISTS tmdb_status text;
+ALTER TABLE work ADD COLUMN IF NOT EXISTS poster_url text;
+ALTER TABLE work ADD COLUMN IF NOT EXISTS backdrop_url text;
+ALTER TABLE work ADD COLUMN IF NOT EXISTS backdrop_urls text[] NOT NULL DEFAULT '{}';
+ALTER TABLE work ADD COLUMN IF NOT EXISTS next_season integer;
+ALTER TABLE work ADD COLUMN IF NOT EXISTS next_episode integer;
+ALTER TABLE work ADD COLUMN IF NOT EXISTS next_air_date text;
 ALTER TABLE work ADD COLUMN IF NOT EXISTS deleted smallint NOT NULL DEFAULT 0;
 CREATE TABLE IF NOT EXISTS queer (
     id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -216,7 +223,13 @@ CREATE TABLE IF NOT EXISTS work_company (
     PRIMARY KEY (work_id, company_id)
 );
 
-DROP TABLE IF EXISTS work_watch;
+CREATE TABLE IF NOT EXISTS work_watch (
+    work_id bigint NOT NULL REFERENCES work (id),
+    name text NOT NULL,
+    offer text NOT NULL,
+    url text,
+    PRIMARY KEY (work_id, name, offer)
+);
 
 CREATE TABLE IF NOT EXISTS work_provider (
     work_id bigint NOT NULL REFERENCES work (id),

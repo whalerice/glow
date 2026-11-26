@@ -2,6 +2,7 @@
 const workListMemory: {
   q: string
   queer?: string
+  status?: string
   sort: { id: string; desc: boolean } | null
   scroll: number
 } = { q: '', sort: null, scroll: 0 }
@@ -31,42 +32,78 @@ type WorkRow = {
   queer: number | null
   queer_name: string | null
   tmdb_id: number | null
+  tmdb_status: string | null
   deleted: number
   cast_count: number
   cast: CastFace[]
 }
 
 const route = useRoute()
+const router = useRouter()
+const forward = router.options.history.state.forward
+const fromWork =
+  typeof forward === 'string' && forward.startsWith('/works/')
 const deleted = computed(() => {
   const value = String(route.query.deleted || '0')
   if (value === 'all' || value === '1') return value
   return '0'
 })
 
-const { data, error, refresh } = await storageFetch<{
-  deleted: string
-  works: WorkRow[]
-}>(() => `/api/works?deleted=${deleted.value}`)
-
-const works = computed(() => data.value?.works || [])
-const router = useRouter()
-const forward = router.options.history.state.forward
-const fromWork =
-  typeof forward === 'string' && forward.startsWith('/works/')
 const q = ref(fromWork ? workListMemory.q : '')
 const queerFilter = ref(fromWork ? workListMemory.queer : undefined)
+const statusFilter = ref(fromWork ? workListMemory.status : undefined)
 const sort = ref<SortState | null>(fromWork ? workListMemory.sort : null)
+const pageSizes = [20, 50, 100]
 const page = computed(() => {
   const value = Number(route.query.page)
   if (!Number.isInteger(value) || value < 1) return 1
   return value
 })
+const pageSize = computed(() => {
+  const value = Number(route.query.size)
+  return pageSizes.includes(value) ? value : 20
+})
 
-function listQuery(nextPage: number, filter = deleted.value) {
+const { data, error, refresh } = await storageFetch<{
+  deleted: string
+  page: number
+  total: number
+  works: WorkRow[]
+}>(() => {
+  const params = new URLSearchParams({
+    deleted: deleted.value,
+    page: String(page.value),
+    size: String(pageSize.value)
+  })
+  const needle = q.value.trim()
+  if (needle) params.set('q', needle)
+  if (queerFilter.value) params.set('queer', queerFilter.value)
+  if (statusFilter.value) params.set('status', statusFilter.value)
+  if (sort.value) {
+    params.set('sort', sort.value.id)
+    if (sort.value.desc) params.set('dir', 'desc')
+  }
+  return `/api/works?${params}`
+})
+
+const works = computed(() => data.value?.works || [])
+const total = computed(() => data.value?.total ?? 0)
+
+function listQuery(nextPage: number, filter = deleted.value, size = pageSize.value) {
   const query: Record<string, string> = {}
   if (filter !== '0') query.deleted = filter
   if (nextPage > 1) query.page = String(nextPage)
+  if (size !== 20) query.size = String(size)
   return query
+}
+
+async function onPageSize(value: string) {
+  const size = Number(value)
+  if (!pageSizes.includes(size) || size === pageSize.value) return
+  await navigateTo(
+    { path: '/works', query: listQuery(1, deleted.value, size) },
+    { replace: true }
+  )
 }
 
 const list = ref<HTMLElement | null>(null)
@@ -78,6 +115,7 @@ function scroller() {
 function rememberList() {
   workListMemory.q = q.value
   workListMemory.queer = queerFilter.value
+  workListMemory.status = statusFilter.value
   workListMemory.sort = sort.value
   workListMemory.scroll = scroller()?.scrollTop ?? 0
 }
@@ -87,6 +125,7 @@ onBeforeRouteLeave(rememberList)
 onMounted(() => {
   if (fromWork) nextTick(() => scroller()?.scrollTo(0, workListMemory.scroll))
   tick()
+  tickTmdb()
 })
 
 type EpisodeProgress = {
@@ -120,7 +159,40 @@ async function collectEpisodes() {
   await tick()
 }
 
-onUnmounted(() => clearTimeout(episodeTimer))
+const tmdbProgress = ref<EpisodeProgress | null>(null)
+let tmdbTimer: ReturnType<typeof setTimeout> | undefined
+
+const tmdbBar = computed(() => {
+  if (!tmdbProgress.value?.on || !tmdbProgress.value.total) return 0
+  return Math.floor((tmdbProgress.value.done * 100) / tmdbProgress.value.total)
+})
+
+async function tickTmdb() {
+  const was = tmdbProgress.value?.on
+  const body = await $fetch<EpisodeProgress>('/api/works/collect/progress')
+  if (body.on) {
+    tmdbProgress.value = body
+    tmdbTimer = setTimeout(tickTmdb, 2000)
+    return
+  }
+  tmdbProgress.value = null
+  if (was) await refresh()
+}
+
+async function recollectTmdb() {
+  const ids = picked.value
+  if (!ids.length) return
+  if (!confirm(`${ids.length}개 작품을 재수집합니다.`)) return
+  await $fetch('/api/works/collect', { method: 'POST', body: { ids } })
+  rowSelection.value = {}
+  clearTimeout(tmdbTimer)
+  await tickTmdb()
+}
+
+onUnmounted(() => {
+  clearTimeout(episodeTimer)
+  clearTimeout(tmdbTimer)
+})
 
 async function showPage(next: number) {
   await navigateTo(
@@ -136,43 +208,15 @@ function onSort(id: string) {
   if (page.value !== 1) showPage(1)
 }
 
-function workValue(row: WorkRow, id: string) {
-  if (id === 'title') return row.title
-  if (id === 'queer') return row.queer_name || ''
-  if (id === 'kind') return kindLabel(row.kind)
-  if (id === 'year') return row.year
-  if (id === 'episodes') return row.episodes
-  if (id === 'rating') return row.rating
-  if (id === 'tmdb_id') return row.tmdb_id == null ? '' : 1
-  return row.cast_count
-}
-
-const filtered = computed(() => {
-  const needle = q.value.trim().toLowerCase()
-  const kind = queerFilter.value
-  return works.value.filter(row => {
-    if (needle && !row.title.toLowerCase().includes(needle)) return false
-    if (!kind) return true
-    if (kind === 'none') return row.queer == null
-    return row.queer_name === kind
-  })
-})
-const sorted = computed(() => sortRows(filtered.value, sort.value, workValue))
-const visible = computed(() => pageRows(sorted.value, page.value))
-
-watch([q, queerFilter], () => {
+watch([q, queerFilter, statusFilter], () => {
   if (page.value !== 1) showPage(1)
 })
 
-watch(
-  () => sorted.value.length,
-  count => {
-    if (!data.value) return
-    const max = Math.max(1, Math.ceil(count / PAGE_SIZE))
-    if (page.value > max) showPage(max)
-  },
-  { immediate: true }
-)
+watch(total, count => {
+  if (!data.value) return
+  const max = Math.max(1, Math.ceil(count / pageSize.value))
+  if (page.value > max) showPage(max)
+})
 
 const options = [
   { label: 'All', value: 'all' },
@@ -184,6 +228,19 @@ const queerOptions = [
   { label: 'BL', value: 'BL' },
   { label: 'GL', value: 'GL' },
   { label: 'LGBTQ', value: 'LGBTQ' },
+  { label: '없음', value: 'none' }
+]
+
+const statusOptions = [
+  { label: 'Returning Series', value: 'Returning Series' },
+  { label: 'Planned', value: 'Planned' },
+  { label: 'In Production', value: 'In Production' },
+  { label: 'Post Production', value: 'Post Production' },
+  { label: 'Pilot', value: 'Pilot' },
+  { label: 'Ended', value: 'Ended' },
+  { label: 'Canceled', value: 'Canceled' },
+  { label: 'Released', value: 'Released' },
+  { label: 'Rumored', value: 'Rumored' },
   { label: '없음', value: 'none' }
 ]
 
@@ -201,7 +258,7 @@ const picked = computed(() =>
     .map(([id]) => Number(id))
 )
 
-watch([q, queerFilter, deleted], () => {
+watch([q, queerFilter, statusFilter, deleted], () => {
   rowSelection.value = {}
 })
 
@@ -263,8 +320,8 @@ const columns = computed<TableColumn<WorkRow>[]>(() => {
     col('에피소드', 'episodes', '96px'),
     col('평점', 'rating', '72px'),
     col('TMDB', 'tmdb_id', '80px'),
-    col('출연', 'cast_count', '240px'),
-    { id: 'exception', header: '', meta: fixed('168px') }
+    col('상태', 'tmdb_status', '148px'),
+    col('출연', 'cast_count', '240px')
   ]
 })
 
@@ -284,26 +341,24 @@ async function bulkException() {
   await refresh()
 }
 
+async function bulkAdd() {
+  const ids = picked.value
+  if (!ids.length) return
+  if (!confirm(`${ids.length}개 작품을 추가합니다.`)) return
+  await $fetch('/api/works/exception', {
+    method: 'POST',
+    body: { ids, deleted: 0 }
+  })
+  rowSelection.value = {}
+  await refresh()
+}
+
 async function bulkDelete() {
   const ids = picked.value
   if (!ids.length) return
   if (!confirm(`${ids.length}개 작품을 삭제합니다. 배우와 회사는 남습니다.`)) return
   await $fetch('/api/works/delete', { method: 'POST', body: { ids } })
   rowSelection.value = {}
-  await refresh()
-}
-
-async function removeWork(id: number) {
-  if (!confirm('이 작품을 삭제합니다. 배우와 회사는 남습니다.')) return
-  await $fetch(`/api/works/${id}/delete`, { method: 'POST', body: {} })
-  await refresh()
-}
-
-async function setDeleted(id: number, deleted: 0 | 1) {
-  await $fetch(`/api/works/${id}/exception`, {
-    method: 'POST',
-    body: { deleted }
-  })
   await refresh()
 }
 
@@ -351,7 +406,7 @@ async function submit() {
       :title="errorText(error)"
       class="mb-4"
     />
-    <div class="mb-4 flex items-center justify-between gap-2">
+    <div class="mb-4 flex flex-wrap items-center justify-between gap-2">
       <div class="flex items-center gap-2">
         <USelect
           v-model="queerFilter"
@@ -379,9 +434,30 @@ async function submit() {
           class="w-28"
           @update:model-value="onFilter(String($event))"
         />
+        <USelect
+          v-model="statusFilter"
+          :items="statusOptions"
+          placeholder="상태"
+          class="w-44"
+        >
+          <template #trailing>
+            <UButton
+              v-if="statusFilter"
+              color="neutral"
+              variant="link"
+              size="xs"
+              icon="i-lucide-x"
+              aria-label="상태 전체"
+              class="p-0"
+              @pointerdown.stop.prevent="statusFilter = undefined"
+            />
+            <UIcon name="i-lucide-chevron-down" class="size-5 shrink-0 text-dimmed" />
+          </template>
+        </USelect>
         <UInput v-model="q" placeholder="제목" class="w-48" />
+        <span class="text-sm text-muted tabular-nums">{{ total }}</span>
       </div>
-      <div class="flex items-center gap-2">
+      <div class="flex flex-wrap items-center gap-2">
         <div v-if="episodeProgress?.on" class="min-w-40">
           <p class="text-xs text-muted">
             에피소드 {{ episodeProgress.done }}/{{ episodeProgress.total }} ·
@@ -391,6 +467,26 @@ async function submit() {
             <div class="h-full bg-primary" :style="{ width: `${episodeBar}%` }" />
           </div>
         </div>
+        <div v-if="tmdbProgress?.on" class="min-w-40">
+          <p class="text-xs text-muted">
+            수집 {{ tmdbProgress.done }}/{{ tmdbProgress.total }} ·
+            {{ tmdbProgress.name }}
+          </p>
+          <div class="mt-1 h-1.5 w-40 overflow-hidden rounded bg-accented">
+            <div class="h-full bg-primary" :style="{ width: `${tmdbBar}%` }" />
+          </div>
+        </div>
+        <span v-if="picked.length" class="text-sm text-muted tabular-nums">
+          선택 {{ picked.length }}
+        </span>
+        <UButton
+          color="neutral"
+          variant="outline"
+          :disabled="!picked.length || tmdbProgress?.on"
+          @click="recollectTmdb"
+        >
+          재수집
+        </UButton>
         <UButton
           color="warning"
           variant="outline"
@@ -399,6 +495,7 @@ async function submit() {
         >
           일괄예외
         </UButton>
+        <UButton :disabled="!picked.length" @click="bulkAdd"> 일괄추가 </UButton>
         <UButton
           color="error"
           variant="outline"
@@ -418,15 +515,17 @@ async function submit() {
         <UButton @click="showRegister"> 작품 등록 </UButton>
       </div>
     </div>
-    <p v-if="!sorted.length" class="text-sm text-muted">
+    <p v-if="!works.length" class="text-sm text-muted">
       {{
-        q.trim() || queerFilter ? '검색 결과가 없습니다.' : '수집된 작품이 없습니다.'
+        q.trim() || queerFilter || statusFilter
+          ? '검색 결과가 없습니다.'
+          : '수집된 작품이 없습니다.'
       }}
     </p>
     <UTable
       v-else
       v-model:row-selection="rowSelection"
-      :data="visible"
+      :data="works"
       :columns="columns"
       :get-row-id="(row: WorkRow) => String(row.id)"
       :ui="{ base: 'table-fixed' }"
@@ -472,6 +571,9 @@ async function submit() {
       <template #rating-cell="{ row }">
         {{ row.original.rating ?? '' }}
       </template>
+      <template #tmdb_status-cell="{ row }">
+        {{ row.original.tmdb_status || '' }}
+      </template>
       <template #tmdb_id-cell="{ row }">
         <UBadge
           v-if="row.original.tmdb_id != null"
@@ -496,30 +598,6 @@ async function submit() {
               class="h-12 w-9 rounded object-cover"
             />
           </NuxtLink>
-        </div>
-      </template>
-      <template #exception-cell="{ row }">
-        <div class="flex gap-1">
-          <UButton
-            v-if="row.original.deleted === 1"
-            @click="setDeleted(row.original.id, 0)"
-          >
-            추가
-          </UButton>
-          <UButton
-            v-else
-            color="warning"
-            @click="setDeleted(row.original.id, 1)"
-          >
-            예외
-          </UButton>
-          <UButton
-            color="error"
-            variant="outline"
-            @click="removeWork(row.original.id)"
-          >
-            삭제
-          </UButton>
         </div>
       </template>
     </UTable>
@@ -555,11 +633,18 @@ async function submit() {
         </form>
       </template>
     </UModal>
-    <div v-if="sorted.length > PAGE_SIZE" class="mt-4 flex justify-end">
+    <div class="mt-4 flex flex-wrap items-center justify-end gap-2">
+      <USelect
+        :model-value="String(pageSize)"
+        :items="pageSizes.map(size => ({ label: String(size), value: String(size) }))"
+        class="w-20"
+        @update:model-value="onPageSize(String($event))"
+      />
       <UPagination
+        v-if="total > pageSize"
         :page="page"
-        :items-per-page="PAGE_SIZE"
-        :total="sorted.length"
+        :items-per-page="pageSize"
+        :total="total"
         show-edges
         @update:page="showPage"
       />

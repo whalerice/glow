@@ -144,11 +144,29 @@ def providers(kind: str, tmdb_id: int) -> list[tuple[str, str, str, str | None, 
 
 
 def enrich_companies(conn, work_id: int, kind: str, tmdb_id: int) -> None:
-    data = _get(f"/{kind}/{tmdb_id}", {"append_to_response": "keywords,translations"})
+    data = _get(f"/{kind}/{tmdb_id}", {"append_to_response": "keywords,translations,images"})
     names = keyword_names(data.get("keywords"))
+    backdrops = _backdrop_urls(data)
     conn.execute(
-        "UPDATE work SET homepage = %s, keywords = %s::text[], ko_title = %s WHERE id = %s",
-        (_http(data.get("homepage")), names, ko_title(data), work_id),
+        """
+        UPDATE work
+        SET homepage = %s, keywords = %s::text[], ko_title = %s,
+            tmdb_status = %s, poster_url = %s, backdrop_url = %s,
+            backdrop_urls = %s::text[],
+            next_season = %s, next_episode = %s, next_air_date = %s
+        WHERE id = %s
+        """,
+        (
+            _http(data.get("homepage")),
+            names,
+            ko_title(data),
+            _text(data.get("status")),
+            _logo_url(data.get("poster_path")),
+            backdrops[0] if backdrops else None,
+            backdrops,
+            *_next_air(data.get("next_episode_to_air")),
+            work_id,
+        ),
     )
     apply_gl_keyword(conn, work_id, names)
     networks = data.get("networks") if isinstance(data.get("networks"), list) else []
@@ -356,10 +374,70 @@ def keyword_names(data: object) -> list[str]:
     return names
 
 
+def recollect(work_id: int) -> str:
+    from app.collect import connect
+
+    with connect() as conn:
+        work = conn.execute(
+            "SELECT title, kind, tmdb_id, tmdb_kind FROM work WHERE id = %s",
+            (work_id,),
+        ).fetchone()
+    if work is None:
+        return ""
+    title, kind, tmdb_id, tmdb_kind = work
+    name = title if isinstance(title, str) else ""
+    if isinstance(tmdb_id, int):
+        stored = tmdb_kind if tmdb_kind in ("movie", "tv") else ("movie" if kind == "movie" else "tv")
+        save_tmdb(work_id, str(tmdb_id), stored)
+        return name
+    match_work(work_id)
+    return name
+
+
+def _next_air(value: object) -> tuple[int | None, int | None, str | None]:
+    if not isinstance(value, dict):
+        return None, None, None
+    season = value.get("season_number")
+    episode = value.get("episode_number")
+    return (
+        season if isinstance(season, int) else None,
+        episode if isinstance(episode, int) else None,
+        _text(value.get("air_date")),
+    )
+
+
+def _text(value: object) -> str | None:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
 def _http(value: object) -> str | None:
     if isinstance(value, str) and value.strip().startswith(("http://", "https://")):
         return value.strip()
     return None
+
+
+def _backdrop_urls(data: dict) -> list[str]:
+    images = data.get("images")
+    items = images.get("backdrops") if isinstance(images, dict) else None
+    urls: list[str] = []
+    seen: set[str] = set()
+    primary = _logo_url(data.get("backdrop_path"))
+    if primary is not None:
+        seen.add(primary)
+        urls.append(primary)
+    if not isinstance(items, list):
+        return urls
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        url = _logo_url(item.get("file_path"))
+        if url is None or url in seen:
+            continue
+        seen.add(url)
+        urls.append(url)
+    return urls
 
 
 def _logo_url(path: object) -> str | None:
@@ -377,7 +455,10 @@ def _store(conn, work_id: int, tmdb_id: int, kind: str, rows: list[tuple[str, st
         "UPDATE work SET tmdb_id = %s, tmdb_kind = %s WHERE id = %s",
         (tmdb_id, kind, work_id),
     )
-    conn.execute("DELETE FROM work_provider WHERE work_id = %s", (work_id,))
+    conn.execute(
+        "DELETE FROM work_provider WHERE work_id = %s AND country = ANY(%s)",
+        (work_id, list(COUNTRIES)),
+    )
     for country, name, offer, url, _logo in rows:
         conn.execute(
             """
