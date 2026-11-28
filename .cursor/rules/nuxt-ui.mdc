@@ -1,0 +1,16 @@
+---
+description: Hub UI는 Nuxt UI가 기본, Tailwind는 보조, 자체 구현은 최후
+globs: hub/**/*.{vue,css}
+alwaysApply: false
+---
+
+# Hub UI
+
+기본값이 Nuxt UI 사용. Tailwind CSS는 보조. Nuxt UI와 Tailwind CSS로 해결이 안될 경우만 자체적으로 만든다.
+
+작업 전에 `.cursor/skills/nuxt-ui/SKILL.md`를 읽는다.
+
+- `UButton`, `UModal`, `UTable` 등 기존 `U*`로 맞춘다.
+- Tailwind는 컴포넌트 `class`의 간격·정렬만.
+- 팔레트 유틸(`text-red-500`) 금지. `color` prop 또는 시맨틱 토큰.
+- 새 `i-lucide-*`는 `nuxt.config.ts` `icon.clientBundle.icons`에 추가.
