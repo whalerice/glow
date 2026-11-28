@@ -73,16 +73,6 @@
   font-display: swap;
 }
 
-@font-face {
-  font-family: 'PretendardVariable';
-  src: url('https://cdn.jsdelivr.net/gh/Project-Noonnu/2611030106@font-variable-694/variable-694/PretendardVariable.woff2')
-    format('woff2');
-  font-weight: 45 930;
-  font-display: swap;
-}
-
-/* 가변: font-family: 'PretendardVariable'; font-variation-settings: "wght" 400; */
-
 @theme {
   --font-sans: 'Roboto', 'Pretendard', sans-serif;
 }

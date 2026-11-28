@@ -32,8 +32,10 @@ type WorkRow = {
   queer: number | null
   queer_name: string | null
   tmdb_id: number | null
-  tmdb_status: string | null
+  status: string | null
+  status_name: string | null
   deleted: number
+  credits: boolean
   cast_count: number
   cast: CastFace[]
 }
@@ -44,8 +46,10 @@ const forward = router.options.history.state.forward
 const fromWork =
   typeof forward === 'string' && forward.startsWith('/works/')
 const deleted = computed(() => {
-  const value = String(route.query.deleted || '0')
-  if (value === 'all' || value === '1') return value
+  const value = route.query.deleted
+  if (value === undefined || value === null || value === '') return '0'
+  const text = String(value)
+  if (text === 'all' || text === '0' || text === '1' || text === '2') return text
   return '0'
 })
 
@@ -71,10 +75,10 @@ const { data, error, refresh } = await storageFetch<{
   works: WorkRow[]
 }>(() => {
   const params = new URLSearchParams({
-    deleted: deleted.value,
     page: String(page.value),
     size: String(pageSize.value)
   })
+  if (deleted.value !== '0') params.set('deleted', deleted.value)
   const needle = q.value.trim()
   if (needle) params.set('q', needle)
   if (queerFilter.value) params.set('queer', queerFilter.value)
@@ -91,7 +95,7 @@ const total = computed(() => data.value?.total ?? 0)
 
 function listQuery(nextPage: number, filter = deleted.value, size = pageSize.value) {
   const query: Record<string, string> = {}
-  if (filter !== '0') query.deleted = filter
+  if (filter === 'all' || filter === '1' || filter === '2') query.deleted = filter
   if (nextPage > 1) query.page = String(nextPage)
   if (size !== 20) query.size = String(size)
   return query
@@ -104,12 +108,14 @@ async function onPageSize(value: string) {
     { path: '/works', query: listQuery(1, deleted.value, size) },
     { replace: true }
   )
+  await nextTick()
+  scrollListTop(list.value)
 }
 
 const list = ref<HTMLElement | null>(null)
 
 function scroller() {
-  return list.value?.parentElement?.parentElement
+  return scrollParent(list.value)
 }
 
 function rememberList() {
@@ -189,6 +195,28 @@ async function recollectTmdb() {
   await tickTmdb()
 }
 
+const creditPending = ref(false)
+
+async function bulkFetchCredits() {
+  const ids = picked.value
+  if (!ids.length || creditPending.value) return
+  if (!confirm(`${ids.length}개 작품의 작가·감독을 가져옵니다.`)) return
+  creditPending.value = true
+  message.value = ''
+  try {
+    for (const id of ids) {
+      await $fetch(`/api/works/${id}/credits`, { method: 'POST', body: {} })
+    }
+    rowSelection.value = {}
+    await refresh()
+  } catch (error) {
+    message.value = errorText(error)
+    await refresh()
+  } finally {
+    creditPending.value = false
+  }
+}
+
 onUnmounted(() => {
   clearTimeout(episodeTimer)
   clearTimeout(tmdbTimer)
@@ -200,7 +228,7 @@ async function showPage(next: number) {
     { replace: true }
   )
   await nextTick()
-  list.value?.parentElement?.parentElement?.scrollTo(0, 0)
+  scrollListTop(list.value)
 }
 
 function onSort(id: string) {
@@ -219,9 +247,10 @@ watch(total, count => {
 })
 
 const options = [
-  { label: 'All', value: 'all' },
-  { label: 'Show', value: '0' },
-  { label: 'Hide', value: '1' }
+  { label: '전체', value: 'all' },
+  { label: '노출', value: '0' },
+  { label: '숨김', value: '1' },
+  { label: '삭제', value: '2' }
 ]
 
 const queerOptions = [
@@ -232,15 +261,15 @@ const queerOptions = [
 ]
 
 const statusOptions = [
-  { label: 'Returning Series', value: 'Returning Series' },
-  { label: 'Planned', value: 'Planned' },
-  { label: 'In Production', value: 'In Production' },
-  { label: 'Post Production', value: 'Post Production' },
-  { label: 'Pilot', value: 'Pilot' },
-  { label: 'Ended', value: 'Ended' },
-  { label: 'Canceled', value: 'Canceled' },
-  { label: 'Released', value: 'Released' },
-  { label: 'Rumored', value: 'Rumored' },
+  { label: '방영중', value: 'Returning Series' },
+  { label: '예정', value: 'Planned' },
+  { label: '제작중', value: 'In Production' },
+  { label: '후반작업', value: 'Post Production' },
+  { label: '파일럿', value: 'Pilot' },
+  { label: '종영', value: 'Ended' },
+  { label: '취소', value: 'Canceled' },
+  { label: '공개', value: 'Released' },
+  { label: '루머', value: 'Rumored' },
   { label: '없음', value: 'none' }
 ]
 
@@ -320,7 +349,19 @@ const columns = computed<TableColumn<WorkRow>[]>(() => {
     col('에피소드', 'episodes', '96px'),
     col('평점', 'rating', '72px'),
     col('TMDB', 'tmdb_id', '80px'),
-    col('상태', 'tmdb_status', '148px'),
+    col('상태', 'status', '100px'),
+    {
+      id: 'credits',
+      accessorKey: 'credits',
+      header: () =>
+        h(SortHeader, {
+          label: '작가·감독',
+          id: 'credits',
+          active: sort.value,
+          onSort
+        }),
+      meta: fixed('96px')
+    },
     col('출연', 'cast_count', '240px')
   ]
 })
@@ -356,8 +397,11 @@ async function bulkAdd() {
 async function bulkDelete() {
   const ids = picked.value
   if (!ids.length) return
-  if (!confirm(`${ids.length}개 작품을 삭제합니다. 배우와 회사는 남습니다.`)) return
-  await $fetch('/api/works/delete', { method: 'POST', body: { ids } })
+  if (!confirm(`${ids.length}개 작품을 삭제로 표시합니다. 행은 남습니다.`)) return
+  await $fetch('/api/works/exception', {
+    method: 'POST',
+    body: { ids, deleted: 2 }
+  })
   rowSelection.value = {}
   await refresh()
 }
@@ -400,10 +444,10 @@ async function submit() {
 <template>
   <section ref="list">
     <UAlert
-      v-if="error"
+      v-if="error || (message && !open)"
       color="error"
       variant="subtle"
-      :title="errorText(error)"
+      :title="message || errorText(error)"
       class="mb-4"
     />
     <div class="mb-4 flex flex-wrap items-center justify-between gap-2">
@@ -454,7 +498,20 @@ async function submit() {
             <UIcon name="i-lucide-chevron-down" class="size-5 shrink-0 text-dimmed" />
           </template>
         </USelect>
-        <UInput v-model="q" placeholder="제목" class="w-48" />
+        <UInput v-model="q" placeholder="제목" class="w-48">
+          <template #trailing>
+            <UButton
+              v-if="q"
+              color="neutral"
+              variant="link"
+              size="xs"
+              icon="i-lucide-x"
+              aria-label="검색 지우기"
+              class="p-0"
+              @click="q = ''"
+            />
+          </template>
+        </UInput>
         <span class="text-sm text-muted tabular-nums">{{ total }}</span>
       </div>
       <div class="flex flex-wrap items-center gap-2">
@@ -486,6 +543,15 @@ async function submit() {
           @click="recollectTmdb"
         >
           재수집
+        </UButton>
+        <UButton
+          color="neutral"
+          variant="outline"
+          :disabled="!picked.length || creditPending"
+          :loading="creditPending"
+          @click="bulkFetchCredits"
+        >
+          작가·감독 가져오기
         </UButton>
         <UButton
           color="warning"
@@ -543,9 +609,14 @@ async function submit() {
         </span>
       </template>
       <template #title-cell="{ row }">
-        <NuxtLink :to="`/works/${row.original.id}`" class="font-medium">
+        <NuxtLink
+          v-if="row.original.deleted === 0"
+          :to="`/works/${row.original.id}`"
+          class="font-medium"
+        >
           {{ row.original.title }}
         </NuxtLink>
+        <span v-else class="font-medium">{{ row.original.title }}</span>
         <p v-if="row.original.ko_title" class="text-sm text-muted">
           {{ row.original.ko_title }}
         </p>
@@ -571,12 +642,21 @@ async function submit() {
       <template #rating-cell="{ row }">
         {{ row.original.rating ?? '' }}
       </template>
-      <template #tmdb_status-cell="{ row }">
-        {{ row.original.tmdb_status || '' }}
+      <template #status-cell="{ row }">
+        {{ row.original.status_name || row.original.status || '' }}
       </template>
       <template #tmdb_id-cell="{ row }">
         <UBadge
           v-if="row.original.tmdb_id != null"
+          color="neutral"
+          variant="subtle"
+        >
+          있음
+        </UBadge>
+      </template>
+      <template #credits-cell="{ row }">
+        <UBadge
+          v-if="row.original.credits"
           color="neutral"
           variant="subtle"
         >

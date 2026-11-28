@@ -39,7 +39,19 @@ type Affiliation = {
   is_current: boolean
 }
 
-type Ship = { slug: string; name: string; image_url: string | null }
+type ShipPartner = {
+  id: number
+  name: string | null
+  image_url: string | null
+  deleted: number
+}
+
+type Ship = {
+  slug: string
+  name: string
+  image_url: string | null
+  partners: ShipPartner[]
+}
 
 type Payload = {
   person: Person
@@ -151,10 +163,40 @@ function socials(source: SourceRow) {
   ) as { kind?: string; url: string }[]
 }
 
-async function remove() {
-  if (!confirm('이 배우와 연결을 삭제합니다. 작품과 소속사는 남습니다.')) return
-  await $fetch(`/api/people/${id.value}/delete`, { method: 'POST', body: {} })
-  await navigateTo('/people')
+const collecting = ref(false)
+const recollectError = ref('')
+
+async function recollect() {
+  if (
+    !confirm(
+      'MDL로 다시 수집합니다. 성공하면 위키·Sapphic·팬덤·소속·ship을 지웁니다. 작품과 회사는 남고, 작가·감독 연결은 유지합니다.'
+    )
+  ) {
+    return
+  }
+  collecting.value = true
+  recollectError.value = ''
+  try {
+    await $fetch(`/api/people/${id.value}/recollect`, { method: 'POST', body: {} })
+    await refresh()
+  } catch (err) {
+    recollectError.value = errorText(err)
+  } finally {
+    collecting.value = false
+  }
+}
+
+async function hide(deleted: 1 | 2) {
+  const text =
+    deleted === 1
+      ? '이 배우를 예외 처리합니다.'
+      : '이 배우를 삭제로 표시합니다. 행은 남습니다.'
+  if (!confirm(text)) return
+  await $fetch(`/api/people/${id.value}/exception`, {
+    method: 'POST',
+    body: { deleted }
+  })
+  await navigateTo('/people?deleted=0')
 }
 </script>
 
@@ -166,8 +208,7 @@ async function remove() {
     :title="errorText(error)"
   />
   <div v-else-if="person && data">
-    <NuxtLink to="/people" class="text-sm text-muted"> 배우 </NuxtLink>
-    <section class="mt-3 rounded-lg border border-default bg-default p-6">
+    <section class="rounded-lg border border-default bg-default p-6">
       <div class="flex gap-5">
         <img
           v-if="person.image_url"
@@ -188,9 +229,26 @@ async function remove() {
             </UBadge>
             <UButton
               v-if="data.actor"
+              color="neutral"
+              variant="outline"
+              :loading="collecting"
+              @click="recollect"
+            >
+              재수집
+            </UButton>
+            <UButton
+              v-if="data.actor"
+              color="neutral"
+              variant="outline"
+              @click="hide(1)"
+            >
+              예외
+            </UButton>
+            <UButton
+              v-if="data.actor"
               color="error"
               variant="outline"
-              @click="remove"
+              @click="hide(2)"
             >
               삭제
             </UButton>
@@ -240,10 +298,10 @@ async function remove() {
             </div>
           </dl>
           <UAlert
-            v-if="person.collect_error"
+            v-if="recollectError || person.collect_error"
             color="error"
             variant="subtle"
-            :title="person.collect_error"
+            :title="recollectError || person.collect_error"
             class="mt-4"
           />
         </div>
@@ -338,7 +396,7 @@ async function remove() {
           </div>
         </dl>
       </div>
-      <ul v-if="data.ships.length" class="mt-4 list-disc pl-5 text-sm">
+      <ul v-if="data.ships.length" class="mt-4 space-y-3 text-sm">
         <li v-for="ship in data.ships" :key="ship.slug">
           <a
             class="underline"
@@ -347,11 +405,59 @@ async function remove() {
             rel="noreferrer"
             >{{ ship.name }}</a
           >
+          <div
+            v-if="ship.partners?.length"
+            class="mt-2 flex flex-wrap items-center gap-3"
+          >
+            <NuxtLink
+              v-for="mate in ship.partners.filter(p => p.deleted === 0)"
+              :key="mate.id"
+              :to="`/people/${mate.id}`"
+              class="flex items-center gap-2 font-medium"
+            >
+              <img
+                v-if="mate.image_url"
+                :src="mate.image_url"
+                alt=""
+                class="size-10 rounded-full object-cover"
+              />
+              <span
+                v-else
+                class="flex size-10 items-center justify-center rounded-full bg-elevated text-xs text-muted"
+                >?</span
+              >
+              {{ mate.name || '이름 없음' }}
+            </NuxtLink>
+            <span
+              v-for="mate in ship.partners.filter(p => p.deleted !== 0)"
+              :key="`x-${mate.id}`"
+              class="flex items-center gap-2 text-muted"
+            >
+              <img
+                v-if="mate.image_url"
+                :src="mate.image_url"
+                alt=""
+                class="size-10 rounded-full object-cover"
+              />
+              <span
+                v-else
+                class="flex size-10 items-center justify-center rounded-full bg-elevated text-xs"
+                >?</span
+              >
+              {{ mate.name || '이름 없음' }}
+            </span>
+          </div>
         </li>
       </ul>
       <ul v-if="socials(sapphic).length" class="mt-3 list-disc pl-5 text-sm">
         <li v-for="item in socials(sapphic)" :key="item.url">
-          <a class="underline" :href="item.url">{{ item.kind || item.url }}</a>
+          <a
+            class="underline"
+            :href="item.url"
+            target="_blank"
+            rel="noreferrer"
+            >{{ item.kind || item.url }}</a
+          >
         </li>
       </ul>
       <p
@@ -439,6 +545,13 @@ async function remove() {
               <dd>{{ payloadText(fandom, 'years_active') }}</dd>
             </div>
           </dl>
+          <ul v-if="socials(fandom).length" class="mt-3 list-disc pl-5 text-sm">
+            <li v-for="item in socials(fandom)" :key="item.url">
+              <a class="underline" :href="item.url" target="_blank" rel="noreferrer">{{
+                item.kind || item.url
+              }}</a>
+            </li>
+          </ul>
           <p
             v-if="payloadText(fandom, 'early_life')"
             class="mt-4 max-h-72 overflow-y-auto whitespace-pre-line text-sm leading-6"

@@ -46,10 +46,10 @@ def match_work(work_id: int) -> None:
 
     with connect() as conn:
         work = conn.execute(
-            "SELECT id, title, kind, year, tmdb_id FROM work WHERE id = %s",
+            "SELECT id, title, kind, year, tmdb_id, deleted FROM work WHERE id = %s",
             (work_id,),
         ).fetchone()
-        if work is None or work[4] is not None:
+        if work is None or work[4] is not None or int(work[5] or 0) != 0:
             return
         kind = "movie" if work[2] == "movie" else "tv"
         found = search(kind, work[1], work[3])
@@ -73,11 +73,55 @@ def save_tmdb(work_id: int, raw_id: str, raw_kind: str) -> None:
     from app.collect import connect
 
     with connect() as conn:
-        found = conn.execute("SELECT 1 FROM work WHERE id = %s", (work_id,)).fetchone()
+        found = conn.execute(
+            "SELECT deleted FROM work WHERE id = %s",
+            (work_id,),
+        ).fetchone()
         if found is None:
             raise ValueError("없는 작품입니다")
+        if int(found[0] or 0) != 0:
+            raise ValueError("숨김·삭제된 작품입니다")
         _store(conn, work_id, tmdb_id, kind, rows)
         enrich_companies(conn, work_id, kind, tmdb_id)
+        conn.commit()
+
+
+def clear_tmdb(work_id: int) -> None:
+    from app.collect import connect
+
+    with connect() as conn:
+        found = conn.execute(
+            "SELECT deleted FROM work WHERE id = %s",
+            (work_id,),
+        ).fetchone()
+        if found is None:
+            raise ValueError("없는 작품입니다")
+        if int(found[0] or 0) != 0:
+            raise ValueError("숨김·삭제된 작품입니다")
+        conn.execute(
+            """
+            UPDATE work
+            SET tmdb_id = NULL,
+                tmdb_kind = NULL,
+                status = NULL,
+                ko_title = NULL,
+                homepage = NULL,
+                teaser_url = NULL,
+                keywords = NULL,
+                poster_url = NULL,
+                backdrop_url = NULL,
+                backdrop_urls = '{}'::text[],
+                next_season = NULL,
+                next_episode = NULL,
+                next_air_date = NULL
+            WHERE id = %s
+            """,
+            (work_id,),
+        )
+        conn.execute(
+            "DELETE FROM work_provider WHERE work_id = %s AND country = ANY(%s)",
+            (work_id, list(COUNTRIES)),
+        )
         conn.commit()
 
 
@@ -144,23 +188,31 @@ def providers(kind: str, tmdb_id: int) -> list[tuple[str, str, str, str | None, 
 
 
 def enrich_companies(conn, work_id: int, kind: str, tmdb_id: int) -> None:
-    data = _get(f"/{kind}/{tmdb_id}", {"append_to_response": "keywords,translations,images"})
+    data = _get(
+        f"/{kind}/{tmdb_id}",
+        {
+            "append_to_response": "keywords,translations,images,videos",
+            "include_video_language": "en,th,ko,null",
+        },
+    )
     names = keyword_names(data.get("keywords"))
     backdrops = _backdrop_urls(data)
+    status = ensure_work_status(conn, data.get("status"))
     conn.execute(
         """
         UPDATE work
-        SET homepage = %s, keywords = %s::text[], ko_title = %s,
-            tmdb_status = %s, poster_url = %s, backdrop_url = %s,
+        SET homepage = %s, teaser_url = %s, keywords = %s::text[], ko_title = %s,
+            status = %s, poster_url = %s, backdrop_url = %s,
             backdrop_urls = %s::text[],
             next_season = %s, next_episode = %s, next_air_date = %s
         WHERE id = %s
         """,
         (
             _http(data.get("homepage")),
+            pick_teaser_url(data.get("videos")),
             names,
             ko_title(data),
-            _text(data.get("status")),
+            status,
             _logo_url(data.get("poster_path")),
             backdrops[0] if backdrops else None,
             backdrops,
@@ -379,12 +431,12 @@ def recollect(work_id: int) -> str:
 
     with connect() as conn:
         work = conn.execute(
-            "SELECT title, kind, tmdb_id, tmdb_kind FROM work WHERE id = %s",
+            "SELECT title, kind, tmdb_id, tmdb_kind, deleted FROM work WHERE id = %s",
             (work_id,),
         ).fetchone()
-    if work is None:
+    if work is None or int(work[4] or 0) != 0:
         return ""
-    title, kind, tmdb_id, tmdb_kind = work
+    title, kind, tmdb_id, tmdb_kind, _deleted = work
     name = title if isinstance(title, str) else ""
     if isinstance(tmdb_id, int):
         stored = tmdb_kind if tmdb_kind in ("movie", "tv") else ("movie" if kind == "movie" else "tv")
@@ -404,6 +456,43 @@ def _next_air(value: object) -> tuple[int | None, int | None, str | None]:
         episode if isinstance(episode, int) else None,
         _text(value.get("air_date")),
     )
+
+
+def ensure_work_status(conn, value: object) -> str | None:
+    key = _text(value)
+    if key is None:
+        return None
+    conn.execute(
+        """
+        INSERT INTO work_status (key, name) VALUES (%s, %s)
+        ON CONFLICT (key) DO NOTHING
+        """,
+        (key, key),
+    )
+    return key
+
+
+def pick_teaser_url(videos: object) -> str | None:
+    results = videos.get("results") if isinstance(videos, dict) else None
+    if not isinstance(results, list):
+        return None
+    youtube: list[dict] = []
+    for item in results:
+        if not isinstance(item, dict) or item.get("site") != "YouTube":
+            continue
+        key = item.get("key")
+        if not isinstance(key, str) or not key.strip():
+            continue
+        youtube.append(item)
+    for kind in ("Teaser", "Trailer"):
+        cand = [item for item in youtube if item.get("type") == kind]
+        if not cand:
+            continue
+        cand.sort(key=lambda item: str(item.get("published_at") or ""), reverse=True)
+        cand.sort(key=lambda item: 0 if item.get("official") else 1)
+        key = str(cand[0]["key"]).strip()
+        return f"https://www.youtube.com/watch?v={key}"
+    return None
 
 
 def _text(value: object) -> str | None:

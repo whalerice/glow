@@ -43,6 +43,24 @@ export function pageRows<T>(
   return rows.slice(start, start + size)
 }
 
+export function scrollParent(el: HTMLElement | null | undefined) {
+  let node: HTMLElement | null | undefined = el
+  while (node) {
+    const y = getComputedStyle(node).overflowY
+    if (y === 'auto' || y === 'scroll' || y === 'overlay') return node
+    node = node.parentElement
+  }
+  return el?.parentElement?.parentElement ?? null
+}
+
+export function scrollListTop(el: HTMLElement | null | undefined) {
+  const active = document.activeElement
+  if (active instanceof HTMLElement) active.blur()
+  requestAnimationFrame(() => {
+    scrollParent(el)?.scrollTo(0, 0)
+  })
+}
+
 function selfCheck() {
   const rows = [
     { n: 2, t: 'b' },

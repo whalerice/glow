@@ -50,6 +50,7 @@ class CollectResult(NamedTuple):
     status: str
     person_id: int
     works: int = 0
+    created: tuple = ()
 
 
 def register(raw_id: str) -> CollectResult:
@@ -59,6 +60,13 @@ def register(raw_id: str) -> CollectResult:
 
     with connect() as conn:
         apply_schema(conn)
+        existing = conn.execute(
+            "SELECT id, deleted FROM person WHERE mdl_id = %s",
+            (mdl_id,),
+        ).fetchone()
+        if existing is not None and int(existing[1] or 0) != 0:
+            conn.commit()
+            return CollectResult(mdl_id, "collected", int(existing[0]), 0, ())
         person_id = mark_registered(conn, mdl_id)
         conn.commit()
 
@@ -72,7 +80,7 @@ def register(raw_id: str) -> CollectResult:
             conn.commit()
             return CollectResult(mdl_id, "failed", person_id)
         try:
-            link_count = save_success(conn, person_id, body, posters)
+            link_count, created = save_success(conn, person_id, body, posters)
         except Exception as exc:
             conn.rollback()
             mark_failed(conn, person_id, str(exc))
@@ -83,7 +91,7 @@ def register(raw_id: str) -> CollectResult:
         fill_person(person_id)
     except Exception:
         pass
-    return CollectResult(mdl_id, "collected", person_id, link_count)
+    return CollectResult(mdl_id, "collected", person_id, link_count, tuple(created))
 
 
 def connect() -> psycopg.Connection:
@@ -116,6 +124,7 @@ def apply_schema(conn: psycopg.Connection) -> None:
     _rewrite_company_keys(conn)
     _fill_person_roles(conn)
     _normalize_born_texts(conn)
+    _migrate_work_status(conn)
 
 
 def _drop_keyed_company_type(conn: psycopg.Connection) -> list[tuple] | None:
@@ -221,6 +230,49 @@ def _fill_person_roles(conn: psycopg.Connection) -> None:
         ON CONFLICT DO NOTHING
         """
     )
+
+
+def _migrate_work_status(conn: psycopg.Connection) -> None:
+    old = conn.execute(
+        """
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'work'
+          AND column_name = 'tmdb_status'
+        """
+    ).fetchone()
+    if old is not None:
+        conn.execute(
+            """
+            INSERT INTO work_status (key, name)
+            SELECT DISTINCT btrim(tmdb_status), btrim(tmdb_status)
+            FROM work
+            WHERE tmdb_status IS NOT NULL AND btrim(tmdb_status) <> ''
+            ON CONFLICT (key) DO NOTHING
+            """
+        )
+        conn.execute(
+            """
+            UPDATE work
+            SET status = NULLIF(btrim(tmdb_status), '')
+            WHERE status IS NULL
+            """
+        )
+        conn.execute("ALTER TABLE work DROP COLUMN tmdb_status")
+    fk = conn.execute(
+        """
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'work_status_fkey'
+        """
+    ).fetchone()
+    if fk is None:
+        conn.execute(
+            """
+            ALTER TABLE work
+            ADD CONSTRAINT work_status_fkey
+            FOREIGN KEY (status) REFERENCES work_status (key)
+            """
+        )
 
 
 def _normalize_born_texts(conn: psycopg.Connection) -> None:
@@ -568,12 +620,12 @@ def register_work(raw_id: str) -> tuple[int, str, bool]:
 def refresh_work(work_id: int) -> str:
     with connect() as conn:
         row = conn.execute(
-            "SELECT title, mdl_id FROM work WHERE id = %s",
+            "SELECT title, mdl_id, deleted FROM work WHERE id = %s",
             (work_id,),
         ).fetchone()
-    if row is None:
+    if row is None or int(row[2] or 0) != 0:
         return ""
-    title, mdl_id = row
+    title, mdl_id, _deleted = row
     name = title if isinstance(title, str) else ""
     if isinstance(mdl_id, str) and mdl_id.strip():
         _collect_work(mdl_id.strip(), cast=False)
@@ -604,7 +656,7 @@ def _collect_work(mdl_id: str, cast: bool = True) -> int:
         "slug": slug,
     }
     with connect() as conn:
-        work_id = upsert_work(conn, item, kind, drama_detail(data))
+        work_id, _created = upsert_work(conn, item, kind, drama_detail(data))
         if work_id is None:
             raise ValueError("제목이 없습니다")
         conn.commit()
@@ -963,6 +1015,8 @@ def save_success(
     )
 
     links: dict[tuple[int, str], str | None] = {}
+    created: list[dict] = []
+    seen: set[int] = set()
     works = data.get("works") if isinstance(data.get("works"), dict) else {}
     for source_kind, items in works.items():
         kind = KINDS.get(source_kind)
@@ -971,9 +1025,12 @@ def save_success(
         for item in items:
             if not isinstance(item, dict):
                 continue
-            work_id = upsert_work(conn, item, kind, posters.get(item.get("slug")))
+            work_id, is_new = upsert_work(conn, item, kind, posters.get(item.get("slug")))
             if work_id is None:
                 continue
+            if is_new and work_id not in seen:
+                seen.add(work_id)
+                created.append({"id": work_id, "title": text_or_none(item.get("title")) or ""})
             role = item.get("role")
             role_text = role if isinstance(role, str) else ""
             character = item.get("character")
@@ -988,7 +1045,7 @@ def save_success(
             """,
             (person_id, work_id, role, character),
         )
-    return len(links)
+    return len(links), created
 
 
 def upsert_work(
@@ -996,10 +1053,10 @@ def upsert_work(
     item: dict,
     kind: str,
     detail: DramaDetail | None,
-) -> int | None:
+) -> tuple[int | None, bool]:
     title = text_or_none(item.get("title"))
     if title is None:
-        return None
+        return None, False
     year = item.get("year") if isinstance(item.get("year"), int) else None
     episodes = item.get("episodes") if isinstance(item.get("episodes"), int) else None
     rating = item.get("rating") if isinstance(item.get("rating"), (int, float)) else None
@@ -1013,6 +1070,12 @@ def upsert_work(
     fetched = detail is not None
 
     if mdl_id:
+        existing = conn.execute(
+            "SELECT id, deleted FROM work WHERE mdl_id = %s",
+            (mdl_id,),
+        ).fetchone()
+        if existing is not None and int(existing[1] or 0) != 0:
+            return int(existing[0]), False
         row = conn.execute(
             """
             INSERT INTO work (
@@ -1033,18 +1096,25 @@ def upsert_work(
                 tags = CASE WHEN %s THEN EXCLUDED.tags ELSE work.tags END,
                 queer = CASE WHEN %s THEN EXCLUDED.queer ELSE work.queer END,
                 detail_at = CASE WHEN %s THEN now() ELSE work.detail_at END
-            RETURNING id
+            WHERE work.deleted = 0
+            RETURNING id, (xmax = 0)
             """,
             (
                 mdl_id, title, kind, year, episodes, rating, mdl_url, image_url,
                 synopsis, native_title, tags, pair, fetched, fetched, fetched, fetched,
             ),
         ).fetchone()
-        return _store_broadcasters(conn, int(row[0]), detail)
+        if row is None:
+            kept = conn.execute(
+                "SELECT id FROM work WHERE mdl_id = %s",
+                (mdl_id,),
+            ).fetchone()
+            return int(kept[0]), False
+        return _store_broadcasters(conn, int(row[0]), detail), bool(row[1])
 
     row = conn.execute(
         """
-        SELECT id FROM work
+        SELECT id, deleted FROM work
         WHERE mdl_id IS NULL
           AND title = %s
           AND year IS NOT DISTINCT FROM %s
@@ -1053,6 +1123,8 @@ def upsert_work(
         (title, year, kind),
     ).fetchone()
     if row:
+        if int(row[1] or 0) != 0:
+            return int(row[0]), False
         conn.execute(
             """
             UPDATE work
@@ -1065,14 +1137,14 @@ def upsert_work(
                 tags = CASE WHEN %s THEN %s::text[] ELSE tags END,
                 queer = CASE WHEN %s THEN %s ELSE queer END,
                 detail_at = CASE WHEN %s THEN now() ELSE detail_at END
-            WHERE id = %s
+            WHERE id = %s AND deleted = 0
             """,
             (
                 episodes, rating, mdl_url, image_url, synopsis, native_title,
                 fetched, tags or [], fetched, pair, fetched, row[0],
             ),
         )
-        return _store_broadcasters(conn, int(row[0]), detail)
+        return _store_broadcasters(conn, int(row[0]), detail), False
     row = conn.execute(
         """
         INSERT INTO work (
@@ -1087,7 +1159,7 @@ def upsert_work(
             synopsis, native_title, tags, pair, fetched,
         ),
     ).fetchone()
-    return _store_broadcasters(conn, int(row[0]), detail)
+    return _store_broadcasters(conn, int(row[0]), detail), True
 
 
 def _store_broadcasters(
@@ -1682,7 +1754,8 @@ def upsert_credit_person(conn: psycopg.Connection, profile: dict) -> int:
                 ELSE EXCLUDED.socials
             END,
             mdl_url = COALESCE(EXCLUDED.mdl_url, person.mdl_url)
-        WHERE NOT EXISTS (
+        WHERE person.deleted = 0
+          AND NOT EXISTS (
             SELECT 1 FROM person_role
             WHERE person_id = person.id AND role_code = 'a'
         )

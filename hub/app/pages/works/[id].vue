@@ -20,9 +20,11 @@ type Work = {
   aired_on: string | null
   content_rating: string | null
   homepage: string | null
+  teaser_url: string | null
   tmdb_id: number | null
   tmdb_kind: string | null
-  tmdb_status: string | null
+  status: string | null
+  status_name: string | null
   next_season: number | null
   next_episode: number | null
   next_air_date: string | null
@@ -36,6 +38,7 @@ type Cast = {
   id: number
   name: string | null
   native_name: string | null
+  image_url: string | null
   role: string
   character_name: string | null
 }
@@ -143,6 +146,7 @@ const episodeColumns: TableColumn<Episode>[] = [
   }
 ]
 const castColumns: TableColumn<Cast>[] = [
+  { accessorKey: 'image_url', header: '' },
   { accessorKey: 'name', header: '배우' },
   { accessorKey: 'role', header: '구분' },
   { accessorKey: 'character_name', header: '배역' }
@@ -177,11 +181,16 @@ async function recollect() {
 }
 
 async function removeWork() {
-  if (!confirm('이 작품을 삭제합니다. 배우와 회사는 남습니다.')) return
-  await run(`/api/works/${id.value}/delete`)
+  if (!confirm('이 작품을 삭제로 표시합니다. 행은 남습니다.')) return
+  await run(`/api/works/${id.value}/exception`, { deleted: '2' })
 }
 
-async function run(path: string, body: Record<string, string> = {}) {
+async function clearTmdb() {
+  if (!confirm('TMDB id와 수집 내용을 삭제합니다.')) return
+  await run(`/api/works/${id.value}/tmdb`, { clear: true })
+}
+
+async function run(path: string, body: Record<string, string | boolean> = {}) {
   message.value = ''
   pending.value = path
   try {
@@ -210,8 +219,7 @@ async function run(path: string, body: Record<string, string> = {}) {
     :title="errorText(error)"
   />
   <div v-else-if="data">
-    <NuxtLink to="/works" class="text-sm text-muted"> 작품 </NuxtLink>
-    <section class="mt-3 rounded-lg border border-default bg-default p-6">
+    <section class="rounded-lg border border-default bg-default p-6">
       <UCarousel
         v-if="backdrops.length"
         v-slot="{ item }"
@@ -314,9 +322,9 @@ async function run(path: string, body: Record<string, string> = {}) {
               <dt class="text-muted">방영일</dt>
               <dd>{{ data.work.aired_on }}</dd>
             </div>
-            <div v-if="data.work.tmdb_status">
+            <div v-if="data.work.status">
               <dt class="text-muted">상태</dt>
-              <dd>{{ data.work.tmdb_status }}</dd>
+              <dd>{{ data.work.status_name || data.work.status }}</dd>
             </div>
             <div v-if="data.work.next_episode != null || data.work.next_air_date">
               <dt class="text-muted">다음 회차</dt>
@@ -341,6 +349,22 @@ async function run(path: string, body: Record<string, string> = {}) {
                 >
                 <template v-else>
                   {{ data.work.homepage }}
+                </template>
+              </dd>
+            </div>
+            <div v-if="data.work.teaser_url">
+              <dt class="text-muted">Teaser</dt>
+              <dd>
+                <a
+                  v-if="httpUrl(data.work.teaser_url)"
+                  class="break-all underline"
+                  :href="data.work.teaser_url"
+                  target="_blank"
+                  rel="noreferrer"
+                  >{{ data.work.teaser_url }}</a
+                >
+                <template v-else>
+                  {{ data.work.teaser_url }}
                 </template>
               </dd>
             </div>
@@ -396,6 +420,16 @@ async function run(path: string, body: Record<string, string> = {}) {
                 <UInput v-model="tmdbId" placeholder="TMDB id" class="w-40" />
                 <UButton type="submit" :loading="pending.endsWith('/tmdb')">
                   다시 가져오기
+                </UButton>
+                <UButton
+                  v-if="data.work.tmdb_id != null"
+                  type="button"
+                  color="neutral"
+                  variant="ghost"
+                  :loading="pending.endsWith('/tmdb')"
+                  @click="clearTmdb"
+                >
+                  삭제
                 </UButton>
               </form>
               <div
@@ -632,6 +666,14 @@ async function run(path: string, body: Record<string, string> = {}) {
         출연 배우가 없습니다.
       </p>
       <UTable v-else :data="data.cast" :columns="castColumns">
+        <template #image_url-cell="{ row }">
+          <img
+            v-if="row.original.image_url"
+            :src="row.original.image_url"
+            alt=""
+            class="h-12 w-9 rounded object-cover"
+          />
+        </template>
         <template #name-cell="{ row }">
           <NuxtLink class="font-medium" :to="`/people/${row.original.id}`">
             {{ row.original.name || row.original.native_name || '이름 없음' }}

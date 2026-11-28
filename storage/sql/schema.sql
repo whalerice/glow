@@ -42,6 +42,9 @@ CREATE TABLE IF NOT EXISTS work (
 
 ALTER TABLE person ADD COLUMN IF NOT EXISTS stage_name text;
 ALTER TABLE person ADD COLUMN IF NOT EXISTS socials jsonb NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE person ADD COLUMN IF NOT EXISTS deleted smallint NOT NULL DEFAULT 0;
+ALTER TABLE person DROP CONSTRAINT IF EXISTS person_deleted_chk;
+ALTER TABLE person ADD CONSTRAINT person_deleted_chk CHECK (deleted IN (0, 1, 2));
 ALTER TABLE person DROP COLUMN IF EXISTS age;
 
 ALTER TABLE work ADD COLUMN IF NOT EXISTS image_url text;
@@ -60,7 +63,23 @@ ALTER TABLE work ADD COLUMN IF NOT EXISTS tmdb_kind text;
 ALTER TABLE work ADD COLUMN IF NOT EXISTS keywords text[];
 ALTER TABLE work ADD COLUMN IF NOT EXISTS ko_title text;
 ALTER TABLE work ADD COLUMN IF NOT EXISTS homepage text;
-ALTER TABLE work ADD COLUMN IF NOT EXISTS tmdb_status text;
+ALTER TABLE work ADD COLUMN IF NOT EXISTS teaser_url text;
+CREATE TABLE IF NOT EXISTS work_status (
+    key text PRIMARY KEY,
+    name text NOT NULL
+);
+INSERT INTO work_status (key, name) VALUES
+    ('Returning Series', '방영중'),
+    ('Planned', '예정'),
+    ('In Production', '제작중'),
+    ('Post Production', '후반작업'),
+    ('Pilot', '파일럿'),
+    ('Ended', '종영'),
+    ('Canceled', '취소'),
+    ('Released', '공개'),
+    ('Rumored', '루머')
+ON CONFLICT (key) DO UPDATE SET name = EXCLUDED.name;
+ALTER TABLE work ADD COLUMN IF NOT EXISTS status text;
 ALTER TABLE work ADD COLUMN IF NOT EXISTS poster_url text;
 ALTER TABLE work ADD COLUMN IF NOT EXISTS backdrop_url text;
 ALTER TABLE work ADD COLUMN IF NOT EXISTS backdrop_urls text[] NOT NULL DEFAULT '{}';
@@ -68,6 +87,8 @@ ALTER TABLE work ADD COLUMN IF NOT EXISTS next_season integer;
 ALTER TABLE work ADD COLUMN IF NOT EXISTS next_episode integer;
 ALTER TABLE work ADD COLUMN IF NOT EXISTS next_air_date text;
 ALTER TABLE work ADD COLUMN IF NOT EXISTS deleted smallint NOT NULL DEFAULT 0;
+ALTER TABLE work DROP CONSTRAINT IF EXISTS work_deleted_chk;
+ALTER TABLE work ADD CONSTRAINT work_deleted_chk CHECK (deleted IN (0, 1, 2));
 CREATE TABLE IF NOT EXISTS queer (
     id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     name text NOT NULL UNIQUE

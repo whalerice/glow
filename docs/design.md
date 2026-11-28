@@ -93,6 +93,7 @@ docker compose run --rm app register 70935
 - `collect_status` text NOT NULL. `registered` | `collected` | `failed`
 - `collect_error` text
 - `collected_at` timestamptz
+- `deleted` smallint NOT NULL default `0`. `0` 노출 · `1` 숨김 · `2` 삭제. 작품과 같다. 행은 지우지 않는다. `deleted ≠ 0`이면 재수집·프로필 덮기를 하지 않는다
 - `created_at` timestamptz NOT NULL default `now()`
 
 ### role
@@ -123,11 +124,21 @@ docker compose run --rm app register 70935
 - `content_rating` text. `13+ - Teens 13 or older` → `13+`. `18+ Restricted (violence & profanity)` → `18+`. `G - All Ages` → `전체관람가`
 - `tmdb_id` bigint NULL. TMDB `movie` 또는 `tv` id. 배우 수집 때 비어 있으면 검색으로 채운다. 사람이 고친 값은 다음 수집에서 유지한다
 - `tmdb_kind` text NULL. `movie` | `tv`
+- `status` text NULL → `work_status.key`. TMDB `status`. 수집 때 키가 없으면 `name=key`로 넣고 저장한다
 - `homepage` text NULL. `GET /3/{movie|tv}/{id}`의 `homepage`. `http://` 또는 `https://`만. 없으면 비운다. 다시 가져오면 그 값으로 바꾼다
+- `teaser_url` text NULL. TMDB `videos`에서 YouTube `Teaser` 우선, 없으면 `Trailer`. `official` 우선·최신. `https://www.youtube.com/watch?v={key}`. 없으면 비움. TMDB 삭제 때 함께 비움
 - `image_url`, `synopsis`, `native_title` text. `tags` text[]
 - `detail_at`, `networks_at`, `air_at` timestamptz. 드라마 상세를 받은 시각. 비어 있으면 작품 화면에서 다시 읽는다
-- `deleted` smallint NOT NULL default `0`. 작품 목록과 작품 상세의 예외는 `1`로 둔다. 상세에서 누르면 작품 목록 Show로 돌아간다. 행은 지우지 않는다. 목록 기본은 `0`. `1`만 보거나 전체를 고를 수 있다. `1`은 작품 상세를 열지 않고, 그 목록 제목은 링크가 아니다. 배우 상세·회사·작가 목록의 작품 목록에서는 `1`을 뺀다. 배우 목록의 출연 칸은 보이는 수와 숨긴 수를 `40(7)`로 보여 준다. 그 수는 작가·감독 역할의 `person_work`를 뺀다. 다시 수집해도 `deleted`는 유지한다
+- `deleted` smallint NOT NULL default `0`. `0` 노출 · `1` 숨김(예외) · `2` 삭제. 행은 지우지 않는다. 목록 기본은 `0`(노출). `all`/`0`/`1`/`2`를 고를 수 있다. `deleted ≠ 0`은 상세를 열지 않고, 그 목록 제목은 링크가 아니다. 배우 상세·회사·작가 목록의 작품 목록에서는 `0`만 둔다. 배우 목록의 출연 칸은 보이는 수와 숨긴 수(`deleted ≠ 0`)를 `40(7)`로 보여 준다. 그 수는 작가·감독 역할의 `person_work`를 뺀다. 재수집·TMDB·`upsert_work`는 `deleted = 0`만 내용을 바꾼다. 숨김/삭제 행은 플래그만 유지
 - `created_at` timestamptz NOT NULL default `now()`
+
+### work_status
+
+TMDB 작품 상태. 키는 영문 그대로, `name`은 한글.
+
+- `key` text PRIMARY KEY. 예: `Released`, `Ended`
+- `name` text NOT NULL. 예: `공개`, `종영`
+- 시드: Returning Series→방영중, Planned→예정, In Production→제작중, Post Production→후반작업, Pilot→파일럿, Ended→종영, Canceled→취소, Released→공개, Rumored→루머. 없는 키는 수집 때 `name=key`로 넣는다
 
 ### work_provider
 
@@ -256,11 +267,9 @@ MDL `original_network`가 이 연결이다. 그 작품의 연결은 응답으로
 
 실패 사유는 `collect_error`에 HTTP 상태와 응답 `message`만 남긴다. 재시도는 같은 CLI를 다시 실행한다. 자동 재시도 루프는 두지 않는다. 인물 조회 1회 뒤에 필모그래피 표를 합치려고 인물 페이지를 한 번 더 읽는다. 그 페이지를 못 읽으면 kuryana 목록만 쓴다.
 
-## 배우 삭제
+## 배우·작품 삭제
 
-배우 상세의 삭제. `person_role`에 `a`가 있을 때만. 없으면 404.
-
-지우는 행: 그 사람의 `person_work`, `person_source`, `person_company`, `person_ship`, 그 사람만 남아 있던 `ship`, `person_role`, `person`. `work`와 `company`는 남긴다. `a`이면서 `d` 또는 `w`여도 `person` 행을 지우므로 그 역할 연결도 끊긴다.
+상세·목록의 삭제는 `deleted = 2`로 표시만 한다. 연결 행은 지우지 않는다. 배우 삭제는 `person_role`에 `a`가 있을 때만. 없으면 404. 숨김은 `deleted = 1`, 복구는 `deleted = 0`.
 
 ## Docker Compose
 

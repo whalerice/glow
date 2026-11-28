@@ -7,11 +7,17 @@ type Company = {
   logo_url: string | null
   homepage: string | null
 }
-type Work = { id: number; title: string; year: number | null }
+type Work = {
+  id: number
+  title: string
+  year: number | null
+  image_url: string | null
+}
 type Member = {
   id: number
   name: string | null
   native_name: string | null
+  image_url: string | null
   period_text: string | null
   is_current: boolean
 }
@@ -43,10 +49,30 @@ watch(
 )
 
 const workColumns: TableColumn<Work>[] = [
+  {
+    accessorKey: 'image_url',
+    header: '',
+    meta: {
+      style: {
+        th: { width: '56px', paddingInline: '0' },
+        td: { width: '56px', paddingInline: '0' }
+      }
+    }
+  },
   { accessorKey: 'title', header: '제목' },
   { accessorKey: 'year', header: '연도' }
 ]
 const peopleColumns: TableColumn<Member>[] = [
+  {
+    accessorKey: 'image_url',
+    header: '',
+    meta: {
+      style: {
+        th: { width: '56px', paddingInline: '0' },
+        td: { width: '56px', paddingInline: '0' }
+      }
+    }
+  },
   { accessorKey: 'name', header: '배우' },
   { accessorKey: 'period_text', header: '기간' },
   { accessorKey: 'is_current', header: '현재' }
@@ -77,10 +103,7 @@ async function save() {
     :title="errorText(error)"
   />
   <div v-else-if="data">
-    <NuxtLink to="/companies" class="text-sm text-muted">
-      종합 콘텐츠 스튜디오
-    </NuxtLink>
-    <section class="mt-3 rounded-lg border border-default bg-default p-6">
+    <section class="rounded-lg border border-default bg-default p-6">
       <div class="flex gap-4">
         <span
           v-if="data.company.logo_url"
@@ -147,6 +170,14 @@ async function save() {
         연결된 작품이 없습니다.
       </p>
       <UTable v-else :data="data.works" :columns="workColumns">
+        <template #image_url-cell="{ row }">
+          <img
+            v-if="row.original.image_url"
+            :src="row.original.image_url"
+            alt=""
+            class="h-12 w-9 rounded object-cover"
+          />
+        </template>
         <template #title-cell="{ row }">
           <NuxtLink class="font-medium" :to="`/works/${row.original.id}`">{{
             row.original.title
@@ -167,6 +198,14 @@ async function save() {
         소속 배우가 없습니다.
       </p>
       <UTable v-else :data="data.people" :columns="peopleColumns">
+        <template #image_url-cell="{ row }">
+          <img
+            v-if="row.original.image_url"
+            :src="row.original.image_url"
+            alt=""
+            class="h-12 w-9 rounded object-cover"
+          />
+        </template>
         <template #name-cell="{ row }">
           <NuxtLink class="font-medium" :to="`/people/${row.original.id}`">{{
             row.original.name || row.original.native_name || '이름 없음'

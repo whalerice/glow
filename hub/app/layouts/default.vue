@@ -69,9 +69,12 @@ watch(
     nextTick(() => {
       const forward = router.options.history.state.forward
       if (
-        route.path === '/works' &&
+        (route.path === '/works' ||
+          route.path === '/people' ||
+          route.path === '/credits' ||
+          route.path === '/companies') &&
         typeof forward === 'string' &&
-        forward.startsWith('/works/')
+        forward.startsWith(`${route.path}/`)
       ) {
         return
       }
@@ -122,6 +125,15 @@ watch(
         <UDashboardNavbar :title="title">
           <template #leading>
             <UDashboardSidebarCollapse />
+            <UButton
+              v-if="detail"
+              color="neutral"
+              variant="ghost"
+              icon="i-lucide-arrow-left"
+              @click="back"
+            >
+              뒤로
+            </UButton>
           </template>
           <template #right>
             <UColorModeButton />
@@ -131,16 +143,6 @@ watch(
 
       <template #body>
         <div ref="main">
-          <UButton
-            v-if="detail"
-            color="neutral"
-            variant="ghost"
-            icon="i-lucide-arrow-left"
-            class="mb-4"
-            @click="back"
-          >
-            뒤로
-          </UButton>
           <slot />
         </div>
       </template>

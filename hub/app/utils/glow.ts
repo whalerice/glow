@@ -7,10 +7,12 @@ export type PersonListRow = {
   image_url: string | null
   collect_status: string
   collected_at: string | null
+  deleted: number
   works: number
   hidden: number
   sapphic: boolean
   wiki: boolean
+  ship_partners?: { id: number; name: string | null; image_url: string | null }[]
 }
 
 export type SourceRow = {
@@ -46,10 +48,6 @@ export function stamp(value: string | null) {
   if (Number.isNaN(date.getTime())) return ''
   const pad = (n: number) => String(n).padStart(2, '0')
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
-}
-
-export function worksCount(works: number, hidden: number) {
-  return `${works}(${hidden})`
 }
 
 export function creditLabels(roles: string[] | null) {

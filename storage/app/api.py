@@ -14,17 +14,20 @@ from app.collect import (
     collect_credits,
     collect_episodes,
     connect,
+    credit_role_codes,
     drama_slug,
+    grant_person_roles,
     register,
     register_work,
     refresh_work,
     save_drama_detail,
     save_where_to_watch,
 )
+from app.ids import person_mdl_id
 from app.fandom import SOURCE as FANDOM_SOURCE
 from app.fandom import fetch_page, search as fandom_search, selected_payload as fandom_payload
 from app.sapphic import SOURCE, fetch_star, search, selected_payload
-from app.tmdb import save_tmdb
+from app.tmdb import clear_tmdb, save_tmdb
 from app.wikipedia import SOURCE as WIKI_SOURCE
 from app.wikipedia import fetch_page as fetch_wiki
 from app.wikipedia import gaps, search as wiki_search, selected_payload as wiki_payload
@@ -34,6 +37,7 @@ _ON = False
 _DONE = 0
 _TOTAL = 0
 _NAME = ""
+_CREATED: list[dict] = []
 _WIKI_FIELDS = (
     "image",
     "birth_name",
@@ -82,12 +86,15 @@ def _route(method: str, path: str, query: dict, body: dict) -> tuple[int, dict]:
     if path == "/api/people/works/progress" and method == "GET":
         return 200, progress_payload()
     if path == "/api/people/works" and method == "POST":
-        start_work_refresh()
+        start_work_refresh(_ids(body))
         return 202, {"on": True}
     if path == "/api/people" and method == "GET":
-        return 200, {"people": listed_people()}
+        return 200, people_payload(query)
     if path == "/api/people" and method == "POST":
         return 200, _register(body)
+    if path == "/api/people/exception" and method == "POST":
+        deleted = _deleted_flag(body)
+        return 200, {"ok": True, "count": hide_people(_ids(body), deleted)}
     if path == "/api/works/collect" and method == "POST":
         start_tmdb_collect(_ids(body))
         return 202, tmdb_progress()
@@ -103,19 +110,21 @@ def _route(method: str, path: str, query: dict, body: dict) -> tuple[int, dict]:
     if path == "/api/works" and method == "POST":
         return 200, _register_work(body)
     if path == "/api/works/exception" and method == "POST":
-        deleted = 0 if body.get("deleted") in (0, "0") else 1
+        deleted = _deleted_flag(body)
         return 200, {"ok": True, "count": hide_works(_ids(body), deleted)}
     if path == "/api/works/delete" and method == "POST":
-        return 200, {"ok": True, "count": delete_works(_ids(body))}
+        return 200, {"ok": True, "count": hide_works(_ids(body), 2)}
     if path == "/api/credits" and method == "GET":
-        return 200, {"credits": credit_rows()}
+        return 200, credits_payload(query)
     if path == "/api/companies" and method == "GET":
-        return 200, {"companies": company_rows()}
+        return 200, companies_payload(query)
     person = re.fullmatch(r"/api/people/(\d+)", path)
     person_sapphic = re.fullmatch(r"/api/people/(\d+)/sapphic", path)
     person_fandom = re.fullmatch(r"/api/people/(\d+)/fandom", path)
     person_wiki = re.fullmatch(r"/api/people/(\d+)/wiki", path)
+    person_exception = re.fullmatch(r"/api/people/(\d+)/exception", path)
     person_delete = re.fullmatch(r"/api/people/(\d+)/delete", path)
+    person_recollect = re.fullmatch(r"/api/people/(\d+)/recollect", path)
     work = re.fullmatch(r"/api/works/(\d+)", path)
     work_exception = re.fullmatch(r"/api/works/(\d+)/exception", path)
     work_delete = re.fullmatch(r"/api/works/(\d+)/delete", path)
@@ -144,21 +153,29 @@ def _route(method: str, path: str, query: dict, body: dict) -> tuple[int, dict]:
             str(body.get("lang") or "en"),
         )
         return 200, {"ok": True}
-    if person_delete and method == "POST":
-        if not delete_person(int(person_delete.group(1))):
+    if person_exception and method == "POST":
+        person_id = int(person_exception.group(1))
+        deleted = _deleted_flag(body)
+        if not hide_person(person_id, deleted):
             raise ApiError(404, "없는 배우입니다.")
-        return 200, {"ok": True}
+        return 200, {"ok": True, "deleted": deleted}
+    if person_delete and method == "POST":
+        if not hide_person(int(person_delete.group(1)), 2):
+            raise ApiError(404, "없는 배우입니다.")
+        return 200, {"ok": True, "deleted": 2}
+    if person_recollect and method == "POST":
+        return 200, recollect_person(int(person_recollect.group(1)))
     if person and method == "GET":
         return 200, person_payload(int(person.group(1)))
     if work_exception and method == "POST":
         work_id = int(work_exception.group(1))
-        deleted = 0 if body.get("deleted") in (0, "0") else 1
+        deleted = _deleted_flag(body)
         hide_work(work_id, deleted)
         return 200, {"ok": True, "deleted": deleted}
     if work_delete and method == "POST":
-        if not delete_work(int(work_delete.group(1))):
+        if not hide_work(int(work_delete.group(1)), 2):
             raise ApiError(404, "없는 작품입니다.")
-        return 200, {"ok": True}
+        return 200, {"ok": True, "deleted": 2}
     if work_episodes and method == "POST":
         collect_episodes(int(work_episodes.group(1)))
         return 200, {"ok": True}
@@ -167,6 +184,9 @@ def _route(method: str, path: str, query: dict, body: dict) -> tuple[int, dict]:
         return 200, {"ok": True}
     if work_tmdb and method == "POST":
         work_id = int(work_tmdb.group(1))
+        if body.get("clear") in (True, 1, "1", "true", "True"):
+            clear_tmdb(work_id)
+            return 200, {"ok": True}
         save_tmdb(work_id, str(body.get("tmdb_id") or ""), str(body.get("tmdb_kind") or ""))
         _save_mdl_watch(work_id)
         return 200, {"ok": True}
@@ -199,12 +219,31 @@ def _fields(body: dict) -> list[str]:
 
 
 def _register(body: dict) -> dict:
-    result = register(str(body.get("mdl_id") or ""))
+    raw = str(body.get("mdl_id") or "")
+    mdl_id = person_mdl_id(raw)
+    if mdl_id is None:
+        raise ValueError("숫자 id가 아닙니다")
+    with connect() as conn:
+        found = conn.execute(
+            "SELECT id, name, deleted FROM person WHERE mdl_id = %s",
+            (mdl_id,),
+        ).fetchone()
+    if found:
+        return {
+            "exists": True,
+            "person_id": int(found[0]),
+            "mdl_id": mdl_id,
+            "name": found[1],
+            "deleted": int(found[2] or 0),
+        }
+    result = register(raw)
     return {
+        "exists": False,
         "person_id": result.person_id,
         "mdl_id": result.mdl_id,
         "status": result.status,
         "works": result.works,
+        "deleted": 0,
     }
 
 
@@ -221,40 +260,175 @@ def _counts(rows: list[dict], *keys: str) -> list[dict]:
     return rows
 
 
-def listed_people() -> list[dict]:
-    with connect() as conn:
-        conn.row_factory = dict_row
-        rows = conn.execute(
-            """
-            SELECT p.id, p.mdl_id, p.name, p.native_name, p.nationality,
-                   p.image_url, p.collect_status, p.collected_at,
-                   c.works, c.hidden,
-                   EXISTS (
-                     SELECT 1 FROM person_source s
-                     WHERE s.person_id = p.id AND s.source = %s
-                   ) AS sapphic,
-                   EXISTS (
-                     SELECT 1 FROM person_source s
-                     WHERE s.person_id = p.id AND s.source = %s
-                   ) AS wiki
-            FROM person p
-            LEFT JOIN LATERAL (
-              SELECT count(*) FILTER (WHERE w.deleted = 0) AS works,
-                     count(*) FILTER (WHERE w.deleted = 1) AS hidden
-              FROM person_work pw
-              JOIN work w ON w.id = pw.work_id
-              WHERE pw.person_id = p.id
-                AND NOT (pw.role = ANY(%s))
-            ) c ON true
-            WHERE EXISTS (
+def _deleted_mode(query: dict) -> str:
+    mode = _one(query, "deleted", "0")
+    if mode == "all":
+        return ""
+    if mode in ("0", "1", "2"):
+        return mode
+    return "0"
+
+
+def _deleted_flag(body: dict, default: int = 1) -> int:
+    raw = body.get("deleted", default)
+    if raw in (0, "0"):
+        return 0
+    if raw in (2, "2"):
+        return 2
+    if raw in (1, "1"):
+        return 1
+    return default
+
+
+_PERSON_SORTS = {
+    "name": "COALESCE(p.name, p.native_name)",
+    "mdl_id": "p.mdl_id",
+    "collect_status": "p.collect_status",
+    "sapphic": "sapphic",
+    "wiki": "wiki",
+    "works": "c.works",
+    "collected_at": "p.collected_at",
+}
+
+
+def people_payload(query: dict) -> dict:
+    mode = _deleted_mode(query)
+    page = _page(query)
+    size = _page_size(query)
+    needle = _one(query, "q", "").strip()
+    sort = _one(query, "sort", "")
+    desc = _one(query, "dir", "") == "desc"
+    filters = [
+        """EXISTS (
               SELECT 1 FROM person_role pr
               WHERE pr.person_id = p.id AND pr.role_code = 'a'
-            )
-            ORDER BY p.id DESC
-            """,
-            (SOURCE, WIKI_SOURCE, list(CREDIT_ROLES)),
-        ).fetchall()
-    return _counts(rows, "works", "hidden")
+            )"""
+    ]
+    params: list = []
+    if mode in ("0", "1", "2"):
+        filters.append("p.deleted = %s")
+        params.append(int(mode))
+    if needle:
+        filters.append(
+            "(p.name ILIKE %s ESCAPE '\\' OR p.native_name ILIKE %s ESCAPE '\\')"
+        )
+        like = _like(needle)
+        params.extend((like, like))
+    where = " AND ".join(filters)
+    if sort in _PERSON_SORTS:
+        direction = "DESC" if desc else "ASC"
+        order = f"{_PERSON_SORTS[sort]} {direction} NULLS LAST, p.id DESC"
+    else:
+        order = "p.id DESC"
+    with connect() as conn:
+        conn.row_factory = dict_row
+        total = int(
+            conn.execute(
+                f"""
+                SELECT count(*)
+                FROM person p
+                WHERE {where}
+                """,
+                params,
+            ).fetchone()["count"]
+        )
+        rows = _people_rows(conn, where, params, order, size, (page - 1) * size)
+    return {
+        "deleted": mode,
+        "page": page,
+        "total": total,
+        "people": rows,
+    }
+
+
+def listed_people(mode: str = "0") -> list[dict]:
+    filters = [
+        """EXISTS (
+              SELECT 1 FROM person_role pr
+              WHERE pr.person_id = p.id AND pr.role_code = 'a'
+            )"""
+    ]
+    params: list = []
+    if mode in ("0", "1", "2"):
+        filters.append("p.deleted = %s")
+        params.append(int(mode))
+    where = " AND ".join(filters)
+    with connect() as conn:
+        conn.row_factory = dict_row
+        return _people_rows(conn, where, params, "p.id DESC")
+
+
+def _people_rows(
+    conn,
+    where: str,
+    params: list,
+    order: str,
+    limit: int | None = None,
+    offset: int = 0,
+) -> list[dict]:
+    sql = f"""
+        SELECT p.id, p.mdl_id, p.name, p.native_name, p.nationality,
+               p.image_url, p.collect_status, p.collected_at, p.deleted,
+               c.works, c.hidden, sp.ship_partners,
+               EXISTS (
+                 SELECT 1 FROM person_source s
+                 WHERE s.person_id = p.id AND s.source = %s
+               ) AS sapphic,
+               EXISTS (
+                 SELECT 1 FROM person_source s
+                 WHERE s.person_id = p.id AND s.source = %s
+               ) AS wiki
+        FROM person p
+        LEFT JOIN LATERAL (
+          SELECT count(*) FILTER (WHERE w.deleted = 0) AS works,
+                 count(*) FILTER (WHERE w.deleted <> 0) AS hidden
+          FROM person_work pw
+          JOIN work w ON w.id = pw.work_id
+          WHERE pw.person_id = p.id
+            AND NOT (pw.role = ANY(%s))
+        ) c ON true
+        LEFT JOIN LATERAL (
+          SELECT coalesce(
+            jsonb_agg(
+              jsonb_build_object(
+                'id', x.id,
+                'name', x.name,
+                'image_url', x.image_url
+              )
+              ORDER BY x.name
+            ),
+            '[]'::jsonb
+          ) AS ship_partners
+          FROM (
+            SELECT DISTINCT o.id, o.name, o.image_url
+            FROM person_ship mine
+            JOIN person_ship other
+              ON other.ship_id = mine.ship_id
+             AND other.person_id <> p.id
+            JOIN person o ON o.id = other.person_id AND o.deleted = 0
+            WHERE mine.person_id = p.id
+          ) x
+        ) sp ON true
+        WHERE {where}
+        ORDER BY {order}
+        """
+    args: list = [SOURCE, WIKI_SOURCE, list(CREDIT_ROLES), *params]
+    if limit is not None:
+        sql += " LIMIT %s OFFSET %s"
+        args.extend((limit, offset))
+    rows = conn.execute(sql, args).fetchall()
+    rows = _counts(rows, "works", "hidden", "deleted")
+    for row in rows:
+        row["sapphic"] = bool(row.get("sapphic"))
+        row["wiki"] = bool(row.get("wiki"))
+        partners = row.get("ship_partners")
+        if not isinstance(partners, list):
+            row["ship_partners"] = []
+            continue
+        for partner in partners:
+            if isinstance(partner, dict) and partner.get("id") is not None:
+                partner["id"] = int(partner["id"])
+    return rows
 
 
 def work_state() -> tuple[bool, int, int, str]:
@@ -264,7 +438,16 @@ def work_state() -> tuple[bool, int, int, str]:
 
 def progress_payload() -> dict:
     on, done, total, name = work_state()
-    return {"on": on, "done": done, "total": total, "name": name, "rows": listed_people()}
+    with _LOCK:
+        created = [dict(item) for item in _CREATED]
+    return {
+        "on": on,
+        "done": done,
+        "total": total,
+        "name": name,
+        "rows": listed_people("0"),
+        "created": created,
+    }
 
 
 _EP_LOCK = Lock()
@@ -292,7 +475,11 @@ def start_tmdb_collect(ids: list[int]) -> None:
         return
     with connect() as conn:
         rows = conn.execute(
-            "SELECT id, title FROM work WHERE id = ANY(%s) ORDER BY id",
+            """
+            SELECT id, title FROM work
+            WHERE id = ANY(%s) AND deleted = 0
+            ORDER BY id
+            """,
             (ids,),
         ).fetchall()
     with _TMDB_LOCK:
@@ -366,19 +553,24 @@ def _collect_episodes(rows: list) -> None:
             _EP_ON = False
 
 
-def start_work_refresh() -> None:
-    global _ON, _DONE, _TOTAL, _NAME
+def start_work_refresh(ids: list[int]) -> None:
+    global _ON, _DONE, _TOTAL, _NAME, _CREATED
+    if not ids:
+        return
     with connect() as conn:
         rows = conn.execute(
             """
             SELECT p.mdl_id, COALESCE(NULLIF(p.name, ''), p.mdl_id)
             FROM person p
-            WHERE EXISTS (
-              SELECT 1 FROM person_role pr
-              WHERE pr.person_id = p.id AND pr.role_code = 'a'
-            )
+            WHERE p.id = ANY(%s)
+              AND p.deleted = 0
+              AND EXISTS (
+                SELECT 1 FROM person_role pr
+                WHERE pr.person_id = p.id AND pr.role_code = 'a'
+              )
             ORDER BY p.id
-            """
+            """,
+            (ids,),
         ).fetchall()
     with _LOCK:
         if _ON or not rows:
@@ -387,20 +579,28 @@ def start_work_refresh() -> None:
         _DONE = 0
         _TOTAL = len(rows)
         _NAME = rows[0][1]
+        _CREATED = []
     Thread(target=_refresh_listed_works, args=(rows,), daemon=True).start()
 
 
 def _refresh_listed_works(rows: list) -> None:
-    global _ON, _DONE, _NAME
+    global _ON, _DONE, _NAME, _CREATED
     try:
         for index, (mdl_id, name) in enumerate(rows):
             with _LOCK:
                 _NAME = name
                 _DONE = index
             try:
-                register(str(mdl_id))
+                result = register(str(mdl_id))
             except Exception:
                 continue
+            with _LOCK:
+                seen = {item["id"] for item in _CREATED}
+                for item in result.created:
+                    if item["id"] in seen:
+                        continue
+                    seen.add(item["id"])
+                    _CREATED.append(item)
         with _LOCK:
             _DONE = len(rows)
     finally:
@@ -408,30 +608,75 @@ def _refresh_listed_works(rows: list) -> None:
             _ON = False
 
 
-def delete_person(person_id: int) -> bool:
+def apply_recollect(conn, person_id: int, credits: list[dict]) -> None:
+    conn.execute(
+        "UPDATE person SET socials = '[]'::jsonb WHERE id = %s",
+        (person_id,),
+    )
+    conn.execute("DELETE FROM person_source WHERE person_id = %s", (person_id,))
+    conn.execute("DELETE FROM person_company WHERE person_id = %s", (person_id,))
+    conn.execute("DELETE FROM person_ship WHERE person_id = %s", (person_id,))
+    conn.execute(
+        """
+        DELETE FROM ship
+        WHERE NOT EXISTS (
+          SELECT 1 FROM person_ship WHERE person_ship.ship_id = ship.id
+        )
+        """
+    )
+    for credit in credits:
+        conn.execute(
+            """
+            INSERT INTO person_work (person_id, work_id, role, character_name)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (person_id, work_id, role) DO NOTHING
+            """,
+            (person_id, credit["work_id"], credit["role"], credit["character_name"]),
+        )
+        grant_person_roles(conn, person_id, credit_role_codes(credit["role"]))
+
+
+def recollect_person(person_id: int) -> dict:
     with connect() as conn:
+        conn.row_factory = dict_row
+        person = conn.execute(
+            "SELECT id, mdl_id, deleted FROM person WHERE id = %s",
+            (person_id,),
+        ).fetchone()
+        if person is None or int(person["deleted"] or 0) != 0:
+            raise ApiError(404, "없는 배우입니다.")
         actor = conn.execute(
             "SELECT 1 FROM person_role WHERE person_id = %s AND role_code = 'a'",
             (person_id,),
         ).fetchone()
         if actor is None:
-            return False
-        conn.execute("DELETE FROM person_work WHERE person_id = %s", (person_id,))
-        conn.execute("DELETE FROM person_source WHERE person_id = %s", (person_id,))
-        conn.execute("DELETE FROM person_company WHERE person_id = %s", (person_id,))
-        conn.execute("DELETE FROM person_ship WHERE person_id = %s", (person_id,))
-        conn.execute(
+            raise ApiError(404, "없는 배우입니다.")
+        credits = conn.execute(
             """
-            DELETE FROM ship
-            WHERE NOT EXISTS (
-              SELECT 1 FROM person_ship WHERE person_ship.ship_id = ship.id
-            )
-            """
-        )
-        conn.execute("DELETE FROM person_role WHERE person_id = %s", (person_id,))
-        conn.execute("DELETE FROM person WHERE id = %s", (person_id,))
+            SELECT work_id, role, character_name
+            FROM person_work
+            WHERE person_id = %s AND role = ANY(%s)
+            """,
+            (person_id, list(CREDIT_ROLES)),
+        ).fetchall()
+        mdl_id = person["mdl_id"]
+    result = register(mdl_id)
+    if result.status != "collected":
+        return {
+            "person_id": result.person_id,
+            "mdl_id": result.mdl_id,
+            "status": result.status,
+            "works": result.works,
+        }
+    with connect() as conn:
+        apply_recollect(conn, result.person_id, credits)
         conn.commit()
-    return True
+    return {
+        "person_id": result.person_id,
+        "mdl_id": result.mdl_id,
+        "status": result.status,
+        "works": result.works,
+    }
 
 
 def _ids(body: dict) -> list[int]:
@@ -447,6 +692,42 @@ def _ids(body: dict) -> list[int]:
         elif isinstance(item, str) and item.isdigit():
             ids.append(int(item))
     return ids
+
+
+def hide_people(ids: list[int], deleted: int) -> int:
+    if not ids:
+        return 0
+    with connect() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE person SET deleted = %s
+            WHERE id = ANY(%s)
+              AND EXISTS (
+                SELECT 1 FROM person_role pr
+                WHERE pr.person_id = person.id AND pr.role_code = 'a'
+              )
+            """,
+            (deleted, ids),
+        )
+        conn.commit()
+    return cursor.rowcount
+
+
+def hide_person(person_id: int, deleted: int = 1) -> bool:
+    with connect() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE person SET deleted = %s
+            WHERE id = %s
+              AND EXISTS (
+                SELECT 1 FROM person_role pr
+                WHERE pr.person_id = person.id AND pr.role_code = 'a'
+              )
+            """,
+            (deleted, person_id),
+        )
+        conn.commit()
+    return cursor.rowcount > 0
 
 
 def hide_works(ids: list[int], deleted: int) -> int:
@@ -478,42 +759,23 @@ def _save_mdl_watch(work_id: int) -> None:
         pass
 
 
-def delete_works(ids: list[int]) -> int:
-    if not ids:
-        return 0
+def hide_work(work_id: int, deleted: int = 1) -> bool:
     with connect() as conn:
-        for table in ("episode", "person_work", "work_company", "work_provider", "work_watch"):
-            conn.execute(f"DELETE FROM {table} WHERE work_id = ANY(%s)", (ids,))
-        cursor = conn.execute("DELETE FROM work WHERE id = ANY(%s)", (ids,))
-        conn.commit()
-    return cursor.rowcount
-
-
-def delete_work(work_id: int) -> bool:
-    with connect() as conn:
-        found = conn.execute("SELECT 1 FROM work WHERE id = %s", (work_id,)).fetchone()
-        if found is None:
-            return False
-        for table in ("episode", "person_work", "work_company", "work_provider", "work_watch"):
-            conn.execute(f"DELETE FROM {table} WHERE work_id = %s", (work_id,))
-        conn.execute("DELETE FROM work WHERE id = %s", (work_id,))
-        conn.commit()
-    return True
-
-
-def hide_work(work_id: int, deleted: int = 1) -> None:
-    with connect() as conn:
-        conn.execute(
+        cursor = conn.execute(
             "UPDATE work SET deleted = %s WHERE id = %s",
             (deleted, work_id),
         )
         conn.commit()
+    return cursor.rowcount > 0
 
 
 def person_payload(person_id: int) -> dict:
     with connect() as conn:
         conn.row_factory = dict_row
-        person = conn.execute("SELECT * FROM person WHERE id = %s", (person_id,)).fetchone()
+        person = conn.execute(
+            "SELECT * FROM person WHERE id = %s AND deleted = 0",
+            (person_id,),
+        ).fetchone()
         if person is None:
             raise ApiError(404, "없는 배우입니다.")
         sources = conn.execute(
@@ -585,7 +847,8 @@ _SORTS = {
     "year": "w.year",
     "episodes": "w.episodes",
     "rating": "w.rating",
-    "tmdb_status": "w.tmdb_status",
+    "status": "ws.name",
+    "credits": "credits",
     "cast_count": "cast_count",
 }
 
@@ -612,9 +875,7 @@ def _like(value: str) -> str:
 
 
 def works_payload(query: dict) -> dict:
-    mode = _one(query, "deleted", "0")
-    if mode not in ("all", "0", "1"):
-        mode = "0"
+    mode = _deleted_mode(query)
     page = _page(query)
     size = _page_size(query)
     needle = _one(query, "q", "").strip()
@@ -624,10 +885,9 @@ def works_payload(query: dict) -> dict:
     desc = _one(query, "dir", "") == "desc"
     filters: list[str] = []
     params: list = []
-    if mode == "0":
-        filters.append("w.deleted = 0")
-    elif mode == "1":
-        filters.append("w.deleted = 1")
+    if mode in ("0", "1", "2"):
+        filters.append("w.deleted = %s")
+        params.append(int(mode))
     if needle:
         filters.append("(w.title ILIKE %s ESCAPE '\\' OR w.ko_title ILIKE %s ESCAPE '\\')")
         like = _like(needle)
@@ -638,9 +898,9 @@ def works_payload(query: dict) -> dict:
         filters.append("queer.name = %s")
         params.append(queer)
     if status == "none":
-        filters.append("(w.tmdb_status IS NULL OR btrim(w.tmdb_status) = '')")
+        filters.append("w.status IS NULL")
     elif status in _STATUSES:
-        filters.append("w.tmdb_status = %s")
+        filters.append("w.status = %s")
         params.append(status)
     where = f"WHERE {' AND '.join(filters)}" if filters else ""
     if sort == "tmdb_id":
@@ -658,6 +918,7 @@ def works_payload(query: dict) -> dict:
                 SELECT count(*)
                 FROM work w
                 LEFT JOIN queer ON queer.id = w.queer
+                LEFT JOIN work_status ws ON ws.key = w.status
                 {where}
                 """,
                 params,
@@ -666,17 +927,26 @@ def works_payload(query: dict) -> dict:
         rows = conn.execute(
             f"""
             SELECT w.id, w.title, w.ko_title, w.kind, w.year, w.episodes, w.rating, w.image_url, w.tags,
-                   w.queer, queer.name AS queer_name, w.tmdb_id, w.tmdb_status, w.deleted,
+                   w.queer, queer.name AS queer_name, w.tmdb_id, w.status, ws.name AS status_name,
+                   w.deleted,
+                   EXISTS (
+                     SELECT 1 FROM person_work c
+                     WHERE c.work_id = w.id AND c.role = ANY(%s)
+                   ) AS credits,
                    (SELECT count(*) FROM person_work pw
+                    JOIN person p ON p.id = pw.person_id AND p.deleted = 0
                     WHERE pw.work_id = w.id AND NOT (pw.role = ANY(%s))) AS cast_count
             FROM work w
             LEFT JOIN queer ON queer.id = w.queer
+            LEFT JOIN work_status ws ON ws.key = w.status
             {where}
             ORDER BY {order}
             LIMIT %s OFFSET %s
             """,
-            [list(CREDIT_ROLES), *params, size, (page - 1) * size],
+            [list(CREDIT_ROLES), list(CREDIT_ROLES), *params, size, (page - 1) * size],
         ).fetchall()
+        for row in rows:
+            row["credits"] = bool(row.get("credits"))
         faces: dict[int, list[dict]] = {}
         ids = [row["id"] for row in rows]
         if ids:
@@ -686,7 +956,9 @@ def works_payload(query: dict) -> dict:
                 SELECT pw.work_id, p.id, p.name, p.image_url
                 FROM person_work pw
                 JOIN person p ON p.id = pw.person_id
-                WHERE pw.work_id = ANY(%s) AND NOT (pw.role = ANY(%s))
+                WHERE pw.work_id = ANY(%s)
+                  AND p.deleted = 0
+                  AND NOT (pw.role = ANY(%s))
                 ORDER BY p.name
                 """,
                 (ids, list(CREDIT_ROLES)),
@@ -714,21 +986,32 @@ def works_payload(query: dict) -> dict:
 
 def work_payload(work_id: int) -> dict:
     with connect() as conn:
-        found = conn.execute("SELECT 1 FROM work WHERE id = %s", (work_id,)).fetchone()
+        found = conn.execute(
+            "SELECT 1 FROM work WHERE id = %s AND deleted = 0",
+            (work_id,),
+        ).fetchone()
     if found is None:
         raise ApiError(404, "없는 작품입니다.")
     save_drama_detail(work_id)
     with connect() as conn:
         conn.row_factory = dict_row
-        work = conn.execute("SELECT * FROM work WHERE id = %s", (work_id,)).fetchone()
+        work = conn.execute(
+            """
+            SELECT w.*, ws.name AS status_name
+            FROM work w
+            LEFT JOIN work_status ws ON ws.key = w.status
+            WHERE w.id = %s AND w.deleted = 0
+            """,
+            (work_id,),
+        ).fetchone()
         if work is None:
             raise ApiError(404, "없는 작품입니다.")
         cast = conn.execute(
             """
-            SELECT p.id, p.name, p.native_name, pw.role, pw.character_name
+            SELECT p.id, p.name, p.native_name, p.image_url, pw.role, pw.character_name
             FROM person_work pw
             JOIN person p ON p.id = pw.person_id
-            WHERE pw.work_id = %s AND NOT (pw.role = ANY(%s))
+            WHERE pw.work_id = %s AND p.deleted = 0 AND NOT (pw.role = ANY(%s))
             ORDER BY p.name
             """,
             (work_id, list(CREDIT_ROLES)),
@@ -749,7 +1032,7 @@ def work_payload(work_id: int) -> dict:
             SELECT p.id, p.name, p.native_name, p.image_url, pw.role
             FROM person_work pw
             JOIN person p ON p.id = pw.person_id
-            WHERE pw.work_id = %s AND pw.role = ANY(%s)
+            WHERE pw.work_id = %s AND p.deleted = 0 AND pw.role = ANY(%s)
             ORDER BY p.name
             """,
             (work_id, list(CREDIT_ROLES)),
@@ -797,24 +1080,74 @@ def work_payload(work_id: int) -> dict:
     }
 
 
-def credit_rows() -> list[dict]:
+_CREDIT_SORTS = {
+    "name": "COALESCE(p.name, p.native_name)",
+    "nationality": "p.nationality",
+    "works": "works",
+}
+
+
+def credits_payload(query: dict) -> dict:
+    page = _page(query)
+    size = _page_size(query)
+    needle = _one(query, "q", "").strip()
+    sort = _one(query, "sort", "")
+    desc = _one(query, "dir", "") == "desc"
+    filters = [
+        "p.deleted = 0",
+        "pw.role = ANY(%s)",
+    ]
+    params: list = [list(CREDIT_ROLES)]
+    if needle:
+        filters.append(
+            "(p.name ILIKE %s ESCAPE '\\' OR p.native_name ILIKE %s ESCAPE '\\')"
+        )
+        like = _like(needle)
+        params.extend((like, like))
+    where = " AND ".join(filters)
+    if sort in _CREDIT_SORTS:
+        direction = "DESC" if desc else "ASC"
+        order = f"{_CREDIT_SORTS[sort]} {direction} NULLS LAST, p.id DESC"
+    else:
+        order = "works DESC NULLS LAST, p.id DESC"
     with connect() as conn:
         conn.row_factory = dict_row
+        total = int(
+            conn.execute(
+                f"""
+                SELECT count(*)
+                FROM (
+                  SELECT p.id
+                  FROM person p
+                  JOIN person_work pw ON pw.person_id = p.id
+                  JOIN work w ON w.id = pw.work_id AND w.deleted = 0
+                  WHERE {where}
+                  GROUP BY p.id
+                ) AS credit_people
+                """,
+                params,
+            ).fetchone()["count"]
+        )
         rows = conn.execute(
-            """
+            f"""
             SELECT p.id, p.name, p.native_name, p.nationality, p.image_url,
                    array_agg(DISTINCT pw.role) AS roles,
                    count(DISTINCT pw.work_id) AS works
             FROM person p
             JOIN person_work pw ON pw.person_id = p.id
             JOIN work w ON w.id = pw.work_id AND w.deleted = 0
-            WHERE pw.role = ANY(%s)
+            WHERE {where}
             GROUP BY p.id
-            ORDER BY p.name
+            ORDER BY {order}
+            LIMIT %s OFFSET %s
             """,
-            (list(CREDIT_ROLES),),
+            [*params, size, (page - 1) * size],
         ).fetchall()
-    return _counts(rows, "works")
+    return {
+        "page": page,
+        "total": total,
+        "credits": _counts(rows, "works"),
+    }
 
 
 def credit_payload(person_id: int) -> dict:
@@ -825,6 +1158,7 @@ def credit_payload(person_id: int) -> dict:
             SELECT p.*
             FROM person p
             WHERE p.id = %s
+              AND p.deleted = 0
               AND EXISTS (
                 SELECT 1 FROM person_work pw
                 JOIN work w ON w.id = pw.work_id AND w.deleted = 0
@@ -837,7 +1171,8 @@ def credit_payload(person_id: int) -> dict:
             raise ApiError(404, "없는 작가·감독입니다.")
         works = conn.execute(
             """
-            SELECT w.id, w.title, w.kind, w.year, pw.role
+            SELECT w.id, w.title, w.kind, w.year, pw.role,
+                   COALESCE(NULLIF(w.poster_url, ''), w.image_url) AS image_url
             FROM person_work pw
             JOIN work w ON w.id = pw.work_id
             WHERE pw.person_id = %s AND w.deleted = 0 AND pw.role = ANY(%s)
@@ -848,13 +1183,14 @@ def credit_payload(person_id: int) -> dict:
     return {"person": person, "works": works}
 
 
-def company_rows() -> list[dict]:
-    with connect() as conn:
-        conn.row_factory = dict_row
-        rows = conn.execute(
-            """
-            SELECT c.id, c.name, c.logo_url,
-                   (SELECT count(*) FROM person_company pc WHERE pc.company_id = c.id) AS members,
+_COMPANY_SORTS = {
+    "name": "c.name",
+    "members": "members",
+    "works": "works",
+    "types": "types",
+}
+
+_COMPANY_TYPES_SQL = """
                    COALESCE((
                        SELECT string_agg(
                            ct.name, ', '
@@ -866,11 +1202,61 @@ def company_rows() -> list[dict]:
                        JOIN org_type ct ON ct.id = l.org_type_id
                        WHERE l.company_id = c.id
                    ), '') AS types
+"""
+
+
+def companies_payload(query: dict) -> dict:
+    page = _page(query)
+    size = _page_size(query)
+    needle = _one(query, "q", "").strip()
+    sort = _one(query, "sort", "")
+    desc = _one(query, "dir", "") == "desc"
+    filters = ["TRUE"]
+    params: list = []
+    if needle:
+        filters.append("c.name ILIKE %s ESCAPE '\\'")
+        params.append(_like(needle))
+    where = " AND ".join(filters)
+    if sort in _COMPANY_SORTS:
+        direction = "DESC" if desc else "ASC"
+        order = f"{_COMPANY_SORTS[sort]} {direction} NULLS LAST, c.id DESC"
+    else:
+        order = "members DESC NULLS LAST, c.id DESC"
+    with connect() as conn:
+        conn.row_factory = dict_row
+        total = int(
+            conn.execute(
+                f"""
+                SELECT count(*)
+                FROM company c
+                WHERE {where}
+                """,
+                params,
+            ).fetchone()["count"]
+        )
+        rows = conn.execute(
+            f"""
+            SELECT c.id, c.name, c.logo_url,
+                   (SELECT count(*) FROM person_company pc WHERE pc.company_id = c.id) AS members,
+                   (
+                     SELECT count(*)
+                     FROM work_company wc
+                     JOIN work w ON w.id = wc.work_id AND w.deleted = 0
+                     WHERE wc.company_id = c.id
+                   ) AS works,
+                   {_COMPANY_TYPES_SQL}
             FROM company c
-            ORDER BY c.name
-            """
+            WHERE {where}
+            ORDER BY {order}
+            LIMIT %s OFFSET %s
+            """,
+            [*params, size, (page - 1) * size],
         ).fetchall()
-    return _counts(rows, "members")
+    return {
+        "page": page,
+        "total": total,
+        "companies": _counts(rows, "members", "works"),
+    }
 
 
 def company_payload(company_id: int) -> dict:
@@ -891,7 +1277,8 @@ def company_payload(company_id: int) -> dict:
         ).fetchall()
         works = conn.execute(
             """
-            SELECT w.id, w.title, w.year
+            SELECT w.id, w.title, w.year,
+                   COALESCE(NULLIF(w.poster_url, ''), w.image_url) AS image_url
             FROM work_company wc
             JOIN work w ON w.id = wc.work_id
             WHERE wc.company_id = %s AND w.deleted = 0
@@ -901,10 +1288,11 @@ def company_payload(company_id: int) -> dict:
         ).fetchall()
         people = conn.execute(
             """
-            SELECT p.id, p.name, p.native_name, pc.period_text, pc.is_current, pc.start_year
+            SELECT p.id, p.name, p.native_name, p.image_url,
+                   pc.period_text, pc.is_current, pc.start_year
             FROM person_company pc
             JOIN person p ON p.id = pc.person_id
-            WHERE pc.company_id = %s AND pc.relation = 'agency'
+            WHERE pc.company_id = %s AND pc.relation = 'agency' AND p.deleted = 0
             ORDER BY pc.start_year NULLS LAST, p.name
             """,
             (company_id,),
@@ -1162,7 +1550,7 @@ def save_sapphic(person_id: int, slug: str, fields: list[str]) -> None:
 def linked_ships(person_id: int) -> list[dict]:
     with connect() as conn:
         conn.row_factory = dict_row
-        return conn.execute(
+        ships = conn.execute(
             """
             SELECT s.slug, s.name, s.image_url
             FROM person_ship ps
@@ -1172,6 +1560,34 @@ def linked_ships(person_id: int) -> list[dict]:
             """,
             (person_id,),
         ).fetchall()
+        if not ships:
+            return []
+        partners = conn.execute(
+            """
+            SELECT s.slug, p.id, p.name, p.image_url, p.deleted
+            FROM person_ship mine
+            JOIN ship s ON s.id = mine.ship_id
+            JOIN person_ship other
+              ON other.ship_id = s.id AND other.person_id <> %s
+            JOIN person p ON p.id = other.person_id
+            WHERE mine.person_id = %s
+            ORDER BY s.name, p.name
+            """,
+            (person_id, person_id),
+        ).fetchall()
+    by_slug: dict[str, list[dict]] = {}
+    for row in partners:
+        by_slug.setdefault(row["slug"], []).append(
+            {
+                "id": row["id"],
+                "name": row["name"],
+                "image_url": row["image_url"],
+                "deleted": int(row["deleted"] or 0),
+            }
+        )
+    for ship in ships:
+        ship["partners"] = by_slug.get(ship["slug"], [])
+    return ships
 
 
 def save_person_ships(conn, person_id: int, ships: list) -> None:

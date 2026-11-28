@@ -1,4 +1,3 @@
-import json
 import os
 import re
 import urllib.error
@@ -153,6 +152,9 @@ _BIO_HEADS = (
     "Biography & Education",
     "Biography \\u0026 Career Path",
     "Biography & Career Path",
+    "Biography \\u0026 Personal Life",
+    "Biography & Personal Life",
+    "Biography \\u0026 Acting Career",
 )
 
 

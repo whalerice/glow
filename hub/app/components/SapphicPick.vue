@@ -116,9 +116,12 @@ async function save(profile: Profile, event: Event) {
           />
           <div class="min-w-0 flex-1">
             <h2 class="text-lg font-semibold">{{ profile.name }}</h2>
-            <a class="text-sm text-muted underline" :href="profile.url">{{
-              profile.slug
-            }}</a>
+            <a
+              class="text-sm text-muted underline"
+              :href="profile.url"
+              target="_blank"
+              >{{ profile.slug }}</a
+            >
             <div class="mt-3 space-y-2">
               <label
                 v-for="item in checks(profile)"

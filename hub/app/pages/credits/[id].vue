@@ -22,6 +22,7 @@ type Work = {
   kind: string
   year: number | null
   role: string
+  image_url: string | null
 }
 type Payload = { person: Person; works: Work[] }
 
@@ -34,6 +35,16 @@ const socials = computed(() =>
   (data.value?.person.socials || []).filter(item => httpUrl(item.url))
 )
 const columns: TableColumn<Work>[] = [
+  {
+    accessorKey: 'image_url',
+    header: '',
+    meta: {
+      style: {
+        th: { width: '56px', paddingInline: '0' },
+        td: { width: '56px', paddingInline: '0' }
+      }
+    }
+  },
   { accessorKey: 'title', header: '제목' },
   { accessorKey: 'kind', header: '종류' },
   { accessorKey: 'year', header: '연도' },
@@ -49,8 +60,7 @@ const columns: TableColumn<Work>[] = [
     :title="errorText(error)"
   />
   <div v-else-if="data">
-    <NuxtLink to="/credits" class="text-sm text-muted"> 작가·감독 </NuxtLink>
-    <section class="mt-3 rounded-lg border border-default bg-default p-6">
+    <section class="rounded-lg border border-default bg-default p-6">
       <div class="flex gap-5">
         <img
           v-if="data.person.image_url"
@@ -136,6 +146,14 @@ const columns: TableColumn<Work>[] = [
         연결된 작품이 없습니다.
       </p>
       <UTable v-else :data="data.works" :columns="columns">
+        <template #image_url-cell="{ row }">
+          <img
+            v-if="row.original.image_url"
+            :src="row.original.image_url"
+            alt=""
+            class="h-12 w-9 rounded object-cover"
+          />
+        </template>
         <template #title-cell="{ row }">
           <NuxtLink class="font-medium" :to="`/works/${row.original.id}`">{{
             row.original.title
